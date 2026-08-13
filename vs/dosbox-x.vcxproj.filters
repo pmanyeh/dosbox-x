@@ -822,6 +822,9 @@
     <ClCompile Include="..\src\debug\debug.cpp">
       <Filter>Sources\debug</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\debug\debug_ai.cpp">
+      <Filter>Sources\debug</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\debug\debug_disasm.cpp">
       <Filter>Sources\debug</Filter>
     </ClCompile>
@@ -1990,6 +1993,9 @@
     </ClInclude>
     <ClInclude Include="..\src\hardware\reSID\wave.h">
       <Filter>Sources\hardware\reSID</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\debug\debug_ai.h">
+      <Filter>Sources\debug</Filter>
     </ClInclude>
     <ClInclude Include="..\src\debug\debug_inc.h">
       <Filter>Sources\debug</Filter>

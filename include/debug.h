@@ -26,6 +26,21 @@ bool DEBUG_ExitLoop(void);
 void DEBUG_RefreshPage(char scroll);
 Bitu DEBUG_EnableDebugger(void);
 
+/* Phase 4C (DOSBox-X-AI project, src/debug/debug_ai.cpp): checks for a
+ * pending AI bridge pause_execution() request and, if one exists, enters
+ * the debugger via the SAME DEBUG_Enable_Handler() Ctrl+Pause already
+ * uses. Defined in debug.cpp; called only from Normal_Loop() (dosbox.cpp),
+ * on the emulator thread, right alongside the existing DEBUG_ExitLoop()
+ * check. See src/debug/debug_ai.h for the full Phase 4C design. */
+bool DEBUG_AI_CheckPauseRequest(void);
+
+/* Phase 4C: defined in src/debug/debug_ai.cpp, declared again here (as
+ * well as in debug_ai.h) so dosbox.cpp -- which already includes this
+ * header, not debug_ai.h -- can mark every Normal_Loop() call as "the
+ * debugger is not active" without a new include dependency. See
+ * src/debug/debug_ai.h for the full Phase 4C design. */
+void DEBUG_AI_SetDebuggerActive(bool active);
+
 extern Bitu cycle_count;
 extern Bitu debugCallback;
 

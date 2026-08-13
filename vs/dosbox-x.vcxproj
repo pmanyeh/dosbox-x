@@ -1152,6 +1152,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\cpu\modrm.cpp" />
     <ClCompile Include="..\src\cpu\paging.cpp" />
     <ClCompile Include="..\src\debug\debug.cpp" />
+    <ClCompile Include="..\src\debug\debug_ai.cpp" />
     <ClCompile Include="..\src\debug\debug_disasm.cpp" />
     <ClCompile Include="..\src\debug\debug_gui.cpp" />
     <ClCompile Include="..\src\debug\debug_win32.cpp" />
@@ -1785,6 +1786,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\src\cpu\instructions.h" />
     <ClInclude Include="..\src\cpu\lazyflags.h" />
     <ClInclude Include="..\src\cpu\modrm.h" />
+    <ClInclude Include="..\src\debug\debug_ai.h" />
     <ClInclude Include="..\src\debug\debug_inc.h" />
     <ClInclude Include="..\src\debug\disasm_tables.h" />
     <ClInclude Include="..\src\dos\cdrom.h" />

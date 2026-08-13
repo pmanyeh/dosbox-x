@@ -433,6 +433,20 @@ static Bitu Normal_Loop(void) {
     bool saved_allow = dosbox_allow_nonrecursive_page_fault;
     Bits ret;
 
+#if C_DEBUG
+    /* Phase 4C (DOSBox-X-AI project): Normal_Loop() only ever runs while
+     * `loop` is NOT DEBUG_Loop, i.e. the debugger is definitely not in
+     * control of execution right now -- true regardless of which internal
+     * DOSBox-X code path got us here (RUN, RUNWATCH-then-RUN, F10/F11
+     * stepping, a human closing the debugger, or execution.continue()).
+     * Setting this unconditionally on every call, rather than only at each
+     * of those individual call sites, is what makes the AI bridge's
+     * "is the debugger active" signal self-correcting: even a transition
+     * this file's other Phase 4C hooks don't explicitly instrument still
+     * becomes visible within one Normal_Loop() call. */
+    DEBUG_AI_SetDebuggerActive(false);
+#endif
+
     if (!menu.hidecycles || menu.showrt) { /* sdlmain.cpp/render.cpp doesn't even maintain the frames count when hiding cycles! */
         uint32_t ticksNew = GetTicks();
         if (ticksNew >= Ticks) {
@@ -509,6 +523,14 @@ static Bitu Normal_Loop(void) {
                 }
 #if C_DEBUG
                 if (DEBUG_ExitLoop())
+                    return 0;
+                /* Phase 4C (DOSBox-X-AI project): the ONLY point at which a
+                 * queued AI bridge pause_execution() request can actually
+                 * take effect -- DEBUG_Loop()/DEBUG_AI_Poll() (the request
+                 * queue every other AI bridge method uses) do not run at
+                 * all while Normal_Loop() has control. See
+                 * src/debug/debug_ai.h for the full design. */
+                if (DEBUG_AI_CheckPauseRequest())
                     return 0;
 #endif
             } else {

@@ -50,6 +50,7 @@ using namespace std;
 #include "../cpu/lazyflags.h"
 #include "keyboard.h"
 #include "control.h"
+#include "debug_ai.h"
 
 bool Clear_SYSENTER_Debug();
 bool Toggle_BreakSYSEnter();
@@ -335,6 +336,12 @@ static bool debugging = false;
 static bool debug_running = false;
 static bool check_rescroll = false;
 
+/* Exposes debug_running (file-local above) to debug_ai.cpp without
+ * relocating or duplicating it -- see debug_ai.h. */
+bool DEBUG_AI_IsDebugRunning(void) {
+    return debug_running;
+}
+
 static FPU_rec oldfpu;
 static bool warn_dynamic = false;
 
@@ -598,6 +605,12 @@ public:
 	static bool				DeleteByIndex		(uint16_t index);
 	static void				DeleteAll			(void);
 	static void				ShowList			(void);
+	// Read-only enumeration for the AI bridge (debug_ai.cpp) -- reuses the
+	// existing BPoints list/ordering (the same 0-based, front-to-back
+	// position ShowList()/DeleteByIndex() already use); does not duplicate
+	// breakpoint storage.
+	static uint16_t			GetCount			(void)						{ return (uint16_t)BPoints.size(); };
+	static CBreakpoint*		GetByIndex			(uint16_t index);
 
 
 private:
@@ -934,6 +947,58 @@ void CBreakpoint::ShowList(void)
 		}
 		nr++;
 	}
+}
+
+CBreakpoint* CBreakpoint::GetByIndex(uint16_t index)
+{
+	// Same 0-based, front-to-back position as ShowList()/DeleteByIndex().
+	int nr = 0;
+	std::list<CBreakpoint*>::iterator i;
+	for (i = BPoints.begin(); i != BPoints.end(); ++i) {
+		if (nr == index) return *i;
+		nr++;
+	}
+	return nullptr;
+}
+
+/* ------------------------------------------------------------------ */
+/* AI bridge breakpoint accessors (debug_ai.cpp calls these). Free      */
+/* functions rather than exposing the CBreakpoint class itself to      */
+/* debug_ai.cpp -- keeps that file free of any DOSBox-X debugger        */
+/* internals beyond plain data. Every one of these is a thin wrapper    */
+/* around an existing CBreakpoint method; none of them touch BPoints    */
+/* directly or add a parallel breakpoint store.                        */
+/* ------------------------------------------------------------------ */
+
+uint16_t DEBUG_AI_BreakpointCount(void) {
+	return CBreakpoint::GetCount();
+}
+
+bool DEBUG_AI_BreakpointInfo(uint16_t index, bool &isPhysical, uint16_t &seg, uint32_t &off) {
+	CBreakpoint *bp = CBreakpoint::GetByIndex(index);
+	if (!bp) return false;
+	isPhysical = (bp->GetType() == BKPNT_PHYSICAL);
+	seg = bp->GetSegment();
+	off = bp->GetOffset();
+	return true;
+}
+
+bool DEBUG_AI_BreakpointExists(uint16_t seg, uint32_t off) {
+	return CBreakpoint::IsBreakpoint(seg, off);
+}
+
+int DEBUG_AI_BreakpointAdd(uint16_t seg, uint32_t off) {
+	CBreakpoint *bp = CBreakpoint::AddBreakpoint(seg, off, false);
+	if (!bp) return -1;
+	uint16_t count = CBreakpoint::GetCount();
+	for (uint16_t i = 0; i < count; i++) {
+		if (CBreakpoint::GetByIndex(i) == bp) return (int)i;
+	}
+	return -1; // should not happen -- AddBreakpoint() always inserts into BPoints
+}
+
+bool DEBUG_AI_BreakpointDelete(uint16_t index) {
+	return CBreakpoint::DeleteByIndex(index);
 }
 
 bool DEBUG_Breakpoint(void)
@@ -2620,28 +2685,7 @@ bool ParseCommand(char* str) {
 	}
 
 	if (command == "RUN") {
-		DrawRegistersUpdateOld();
-		debug_running = false;
-		debugging=false;
-		DrawCode();
-		DrawInput();
-		logBuffSuppressConsole = false;
-		if (logBuffSuppressConsoleNeedUpdate) {
-			logBuffSuppressConsoleNeedUpdate = false;
-			DEBUG_RefreshPage(0);
-		}
-
-		Bits DEBUG_NullCPUCore(void);
-
-		inhibit_int_breakpoint = true;
-		DEBUG_Run(1,false);
-		inhibit_int_breakpoint = false;
-		mainMenu.get_item("debugger_rundebug").check(false).refresh_item(mainMenu);
-		mainMenu.get_item("debugger_runnormal").check(true).refresh_item(mainMenu);
-		mainMenu.get_item("debugger_runwatch").check(false).refresh_item(mainMenu);
-
-		DOSBOX_SetNormalLoop();	
-		GFX_SetTitle(-1,-1,-1,is_paused);
+		DEBUG_AI_DoContinue();
 		return true;
 	}
 
@@ -4078,6 +4122,150 @@ bool ParseCommand(char* str) {
 	return false;
 }
 
+/* Phase 4C: the exact body the "RUN" case above used to have inline,
+ * extracted so it has exactly one implementation shared by the debugger
+ * GUI's RUN command (above) and the AI bridge's execution.continue
+ * (DEBUG_AI_Poll() -> ExecExecutionContinue(), debug_ai.cpp) -- see
+ * Phase4C.md's "do not invent a parallel execution engine". Callable only
+ * from the emulator/debugger thread, and only while the debugger is
+ * currently stopped (both callers guarantee this: ParseCommand() only runs
+ * while DEBUG_Loop() has control, and DEBUG_AI_Poll() only runs from
+ * DEBUG_Loop() too). */
+void DEBUG_AI_DoContinue(void) {
+	DrawRegistersUpdateOld();
+	debug_running = false;
+	debugging=false;
+	DrawCode();
+	DrawInput();
+	logBuffSuppressConsole = false;
+	if (logBuffSuppressConsoleNeedUpdate) {
+		logBuffSuppressConsoleNeedUpdate = false;
+		DEBUG_RefreshPage(0);
+	}
+
+	inhibit_int_breakpoint = true;
+	DEBUG_Run(1,false);
+	inhibit_int_breakpoint = false;
+	mainMenu.get_item("debugger_rundebug").check(false).refresh_item(mainMenu);
+	mainMenu.get_item("debugger_runnormal").check(true).refresh_item(mainMenu);
+	mainMenu.get_item("debugger_runwatch").check(false).refresh_item(mainMenu);
+
+	DOSBOX_SetNormalLoop();
+	GFX_SetTitle(-1,-1,-1,is_paused);
+
+	/* The debugger loop is no longer in control of guest execution as of
+	 * this call (DOSBOX_SetNormalLoop() above takes effect on the very
+	 * next DOSBOX_RunMachine() iteration) -- reflect that immediately
+	 * rather than waiting for Normal_Loop()'s own hook (dosbox.cpp) to
+	 * notice, so a get_debug_status()/execution.pause() issued right
+	 * after execution.continue() returns sees "running" without delay. */
+	DEBUG_AI_SetDebuggerActive(false);
+}
+
+/* Phase 4D: shared post-DEBUG_Run() callback dispatch. A single-stepped
+ * instruction can itself invoke a CALLBACK_Setup()-registered routine (e.g.
+ * INT 21h lands on a C++-implemented DOS API handler rather than real
+ * guest code) -- DEBUG_Run() surfaces that as a positive return value that
+ * must be dispatched through CallBack_Handlers[], exactly as
+ * DEBUG_CheckKeys() already does generically after its command switch for
+ * every OTHER DEBUG_Run() caller (F5/F10/F11/numeric run-N). Factored out
+ * here so the two new functions below (used by BOTH the F10/F11 key
+ * handlers and the AI bridge) apply the identical handling instead of a
+ * second, divergent copy. */
+static int32_t DEBUG_AI_HandleStepCallback(int32_t ret) {
+	if (ret > 0) {
+		if (GCC_UNLIKELY(ret >= (Bits)CB_MAX))
+			ret = 0;
+		else
+			ret = (Bits)(*CallBack_Handlers[ret])();
+		if (ret) {
+			exitLoop = true;
+			CPU_Cycles = CPU_CycleLeft = 0;
+		}
+	}
+	return ret;
+}
+
+/* Phase 4D: shared step-into implementation -- the EXACT SAME mechanism
+ * the debugger GUI's F11 ("trace into") key already uses (DEBUG_Run(1,true),
+ * i.e. the real CPU decoder executes exactly one guest instruction and
+ * control returns to the debugger without switching to Normal_Loop()).
+ * Used by BOTH DEBUG_CheckKeys()'s KEY_F(11) case (below) and the AI
+ * bridge's execution.step_into (DEBUG_AI_Poll() -> debug_ai.cpp), so
+ * there is exactly one step-into implementation, not a parallel one built
+ * for the bridge. Returns the same callback exit code DEBUG_CheckKeys()'s
+ * switch normally produces for F11 (0 = none, negative = caller's loop
+ * must exit) -- callers that don't need it (the AI bridge) simply ignore
+ * it, always reading real post-step state afterward instead. */
+int32_t DEBUG_AI_DoStepInto(void) {
+	DrawRegistersUpdateOld();
+	if(!CPU_IsDynamicCore()) warn_dynamic = false;
+	else if(!warn_dynamic) {
+		DEBUG_WarnDynamic();
+		warn_dynamic = true;
+	}
+	exitLoop = false;
+	mustCompleteInstruction = true;
+	int32_t ret = DEBUG_Run(1,true);
+	mustCompleteInstruction = false;
+	ret = DEBUG_AI_HandleStepCallback(ret);
+
+	/* DEBUG_Run(1,true)'s quickexit=true branch already called
+	 * SetCodeWinStart() (updating codeViewData to the new CS:EIP), but
+	 * that only updates internal state -- unlike the F10/F11 key handler
+	 * (which reaches DEBUG_CheckKeys()'s own "if (!skipDraw)
+	 * DEBUG_DrawScreen();" at the bottom of its key-processing loop), a
+	 * step triggered here (DEBUG_AI_Poll(), before DEBUG_CheckKeys() ever
+	 * runs this iteration) has no other call on this path that actually
+	 * repaints the debugger console. Without this, the human GUI would
+	 * keep showing the pre-step position until some unrelated later event
+	 * (the next real keypress, or another AI call like pause_execution()
+	 * that happens to redraw) -- call it explicitly so step_into() keeps
+	 * the same "GUI reflects the change immediately" guarantee
+	 * execution.continue/execution.pause already have (Phase 4C). */
+	DEBUG_DrawScreen();
+	return ret;
+}
+
+/* Phase 4D: shared step-over implementation -- the EXACT SAME mechanism
+ * the debugger GUI's F10 ("step over") key already uses: StepOver() (above)
+ * disassembles the current instruction and, for a call/int/loop/rep, places
+ * a one-shot breakpoint just past it and resumes via DEBUG_Run(1,false) --
+ * the SAME quickexit=false transition execution.continue/RUN use, which
+ * hands control to Normal_Loop() and lets it run ASYNCHRONOUSLY until that
+ * breakpoint (or any other) is hit and the debugger regains control; this
+ * function does not itself wait for that (see becameAsync below and
+ * DEBUG_AI_CompletePendingSteps() in debug_ai.cpp for how the AI bridge
+ * observes the eventual re-stop). For any other instruction, StepOver()
+ * returns false and this is simply a step-into (DEBUG_AI_DoStepInto()),
+ * exactly matching the original F10 key's fallthrough to F11's code.
+ *
+ * `becameAsync` is set to true only when the call/int/loop/rep,
+ * hand-off-to-Normal_Loop() path was taken, so callers (both the key
+ * handler and the AI bridge) can tell which of the two happened without
+ * re-deriving it from DOSBOX_GetLoop() or re-disassembling anything. */
+int32_t DEBUG_AI_DoStepOver(bool &becameAsync) {
+	becameAsync = false;
+	DrawRegistersUpdateOld();
+	if(!CPU_IsDynamicCore()) warn_dynamic = false;
+	else if(!warn_dynamic) {
+		DEBUG_WarnDynamic();
+		warn_dynamic = true;
+	}
+
+	if (StepOver()) {
+		becameAsync = true;
+		mustCompleteInstruction = true;
+		inhibit_int_breakpoint = true;
+		int32_t ret = DEBUG_Run(1,false);
+		inhibit_int_breakpoint = false;
+		mustCompleteInstruction = false;
+		return DEBUG_AI_HandleStepCallback(ret);
+	}
+
+	return DEBUG_AI_DoStepInto();
+}
+
 char* AnalyzeInstruction(char* inst, bool saveSelector) {
 	static char result[256];
 
@@ -4730,34 +4918,21 @@ uint32_t DEBUG_CheckKeys(void) {
 				}
 				break;
 		case KEY_F(10):	// Step over inst
-				DrawRegistersUpdateOld();
-                if(!CPU_IsDynamicCore()) warn_dynamic = false;
-                else if(!warn_dynamic) {
-                    DEBUG_WarnDynamic();
-                    warn_dynamic = true;
-                }
-                if (StepOver()) {
-					mustCompleteInstruction = true;
-					inhibit_int_breakpoint = true;
-					ret = DEBUG_Run(1,false);
-					inhibit_int_breakpoint = false;
-					mustCompleteInstruction = false;
-					skipDraw = true;
-					break;
+				{
+					// Phase 4D: DEBUG_AI_DoStepOver() (above) is now the ONE
+					// implementation of "step over" -- the exact same
+					// StepOver()+DEBUG_Run() body this case used to have
+					// inline, extracted so it has exactly one implementation
+					// shared with the AI bridge's execution.step_over.
+					bool becameAsync = false;
+					ret = DEBUG_AI_DoStepOver(becameAsync);
 				}
-				// If we aren't stepping over something, do a normal step.
-				/* FALLTHROUGH */
+				break;
 		case KEY_F(11):	// trace into
-				DrawRegistersUpdateOld();
-                if(!CPU_IsDynamicCore()) warn_dynamic = false;
-                else if(!warn_dynamic) {
-                    DEBUG_WarnDynamic();
-                    warn_dynamic = true;
-                }
-				exitLoop = false;
-				mustCompleteInstruction = true;
-				ret = DEBUG_Run(1,true);
-				mustCompleteInstruction = false;
+				// Phase 4D: DEBUG_AI_DoStepInto() (above) is now the ONE
+				// implementation of "trace into", shared with the AI
+				// bridge's execution.step_into.
+				ret = DEBUG_AI_DoStepInto();
 				break;
         case 0x09: //TAB
                 void DBGUI_NextWindow(void);
@@ -4868,6 +5043,47 @@ void dyn_core_dh_debug_flush (void);
 #endif
 
 Bitu DEBUG_Loop(void) {
+    /* Drain any AI bridge requests queued by its socket thread(s) and
+     * execute them here, on the emulator/debugger thread, before doing
+     * anything else this iteration. This is the one safe place to do
+     * so -- see docs/dosbox-debugger-analysis.md section 5.9. */
+    DEBUG_AI_Poll();
+
+    /* Phase 4C: an execution.continue request drained by DEBUG_AI_Poll()
+     * just above may have called DEBUG_AI_DoContinue(), which already
+     * called DOSBOX_SetNormalLoop() -- the SAME transition the GUI's own
+     * "RUN" command makes, which normally happens at the very end of this
+     * function's DEBUG_CheckKeys() call chain, not partway through. Bail
+     * out immediately rather than falling through to the debug_running/
+     * DEBUG_CheckKeys() logic below (which assumes the debugger is still
+     * in control this iteration); DOSBOX_RunMachine()'s next iteration
+     * will call the normal loop instead of DEBUG_Loop() again. */
+    if (DOSBOX_GetLoop() != DEBUG_Loop)
+        return 0;
+
+    /* Reached only while the debugger genuinely still has control this
+     * iteration -- mirrors DEBUG_AI_DoContinue()'s DEBUG_AI_SetDebuggerActive(false)
+     * for the entry side, so debug.status/execution.continue/execution.pause
+     * see "stopped" as soon as DEBUG_Loop() is genuinely running, no matter
+     * which of its several entry points (Ctrl+Pause, -break-start, a
+     * breakpoint hit, an AI pause_execution()) got it here. */
+    DEBUG_AI_SetDebuggerActive(true);
+
+    /* Phase 4D: completes any execution.step_over() that took the
+     * asynchronous call/int/loop/rep path (DEBUG_AI_DoStepOver() ->
+     * StepOver()+DEBUG_Run(1,false), which handed control to Normal_Loop()
+     * exactly like execution.continue does -- see the bail-out just above).
+     * This is the SAME point Phase 4C's DEBUG_AI_SetDebuggerActive(true)
+     * reasoning already establishes as "the debugger genuinely has control
+     * again this iteration", regardless of which entry point (a breakpoint
+     * hit, Ctrl+Pause, an AI pause_execution()) produced it -- so it is
+     * also the correct, single place to notice "the one-shot breakpoint
+     * StepOver() placed just past the CALL was reached (or any other event
+     * re-entered the debugger)" without a second, step-specific hook
+     * elsewhere. A no-op (cheap empty-list check) on every iteration where
+     * no execution.step_over() is pending. */
+    DEBUG_AI_CompletePendingSteps();
+
     if (debug_running) {
         Bitu now = SDL_GetTicks();
 
@@ -5056,6 +5272,43 @@ void DEBUG_Enable_Handler(bool pressed) {
     runnormal = false;
     if (debugrunmode==1) {char command[] = "RUN"; ParseCommand(command);}
     else if (debugrunmode==2) {char command[] = "RUNWATCH"; ParseCommand(command);}
+}
+
+/* Phase 4C: pause_execution(). Called from Normal_Loop()'s existing
+ * per-iteration DEBUG_ExitLoop() hook (dosbox.cpp), i.e. on the emulator
+ * thread, exactly once per Normal_Loop iteration -- so an AI
+ * pause_execution() request takes effect within roughly one instruction
+ * batch of guest execution, the same responsiveness a physical Ctrl+Pause
+ * already has, and not on any timer/sleep/polling schedule. Returns false
+ * immediately (cheap) if nothing is pending.
+ *
+ * This function is only ever reached while Normal_Loop() has control,
+ * i.e. only while the debugger is NOT already active, so
+ * DEBUG_Enable_Handler()'s toggle behavior (see above: pressed once more
+ * while already debugging would instead RESUME execution) always takes
+ * its "enter debugger" branch here -- reusing the EXACT SAME transition
+ * Ctrl+Pause already performs, rather than a second, parallel one. */
+bool DEBUG_AI_CheckPauseRequest(void) {
+    if (!DEBUG_AI_HasPendingPause())
+        return false;
+
+    DEBUG_Enable_Handler(true);
+
+    /* DEBUG_Enable_Handler() above already set debugging=true and
+     * repointed the main loop at DEBUG_Loop() synchronously, on this same
+     * call stack -- the transition is real and complete by this point, not
+     * merely requested, so it is honest to mark it active immediately
+     * rather than waiting for DEBUG_Loop()'s own DEBUG_AI_SetDebuggerActive(true)
+     * call on its first iteration (which will also run, redundantly but
+     * harmlessly, right after this). */
+    DEBUG_AI_SetDebuggerActive(true);
+
+    /* Hands real, current debugger state (registers, CS:EIP, current
+     * instruction -- all safely readable now that we're on the emulator
+     * thread AFTER the transition) back to every connection waiting on
+     * this pause. */
+    DEBUG_AI_CompletePendingPauses();
+    return true;
 }
 
 void DEBUG_DrawScreen(void) {
@@ -5805,6 +6058,7 @@ void DEBUG_SetupConsole(void) {
 }
 
 void DEBUG_ShutDown(Section * /*sec*/) {
+	DEBUG_AI_ShutDown();
 	CBreakpoint::DeleteAll();
 	CDebugVar::DeleteAll();
 	if (dbg.win_main != NULL) {
@@ -5844,6 +6098,12 @@ void DEBUG_Init() {
 
 	/* shutdown function */
 	AddExitFunction(AddExitFunctionFuncPair(DEBUG_ShutDown));
+
+	/* Native AI bridge (127.0.0.1:9876, read-only in Phase 3B). Starts
+	 * unconditionally alongside the rest of the debug subsystem; it
+	 * queues requests until DEBUG_Loop() next runs (see DEBUG_AI_Poll
+	 * above) and never touches emulator state from its own thread. */
+	DEBUG_AI_Init();
 }
 
 // DEBUGGING VAR STUFF
