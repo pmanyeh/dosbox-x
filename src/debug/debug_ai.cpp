@@ -303,7 +303,7 @@ struct AIConnection {
 enum class AIMethod {
     DebugStatus, CpuGet, MemoryRead, CodeCurrent, CodeDisassemble,
     MemoryWrite, RegisterWrite,
-    BreakpointSet, BreakpointDelete, BreakpointList,
+    BreakpointSet, ProtectedMemoryBreakpointSet, RealMemoryBreakpointSet, BreakpointDelete, BreakpointList,
     ExecutionContinue,
     ExecutionStepInto, ExecutionStepOver
 };
@@ -796,6 +796,39 @@ static std::string ExecBreakpointSet(long long id, uint16_t seg, uint32_t off) {
     return std::string(buf);
 }
 
+static std::string ExecProtectedMemoryBreakpointSet(long long id, uint16_t selector, uint32_t off) {
+    int bpIndex = DEBUG_AI_ProtectedMemoryBreakpointAdd(selector, off);
+    if (bpIndex < 0) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"failed to create protected-memory breakpoint\"}}",
+            id);
+        return std::string(buf);
+    }
+
+    char buf[288];
+    snprintf(buf, sizeof(buf),
+        "{\"id\":%lld,\"ok\":true,\"result\":{\"id\":%d,\"address\":\"%04X:%04X\",\"type\":\"protected_memory\",\"enabled\":true}}",
+        id, bpIndex, (unsigned)selector, (unsigned)(off & 0xFFFF));
+    return std::string(buf);
+}
+
+static std::string ExecRealMemoryBreakpointSet(long long id, uint16_t seg, uint32_t off) {
+    int bpIndex = DEBUG_AI_RealMemoryBreakpointAdd(seg, off);
+    if (bpIndex < 0) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"failed to create real-mode memory breakpoint\"}}",
+            id);
+        return std::string(buf);
+    }
+    char buf[272];
+    snprintf(buf, sizeof(buf),
+        "{\"id\":%lld,\"ok\":true,\"result\":{\"id\":%d,\"address\":\"%04X:%04X\",\"type\":\"memory\",\"enabled\":true}}",
+        id, bpIndex, (unsigned)seg, (unsigned)(off & 0xFFFF));
+    return std::string(buf);
+}
+
 static std::string ExecBreakpointDelete(long long id, long long index) {
     bool ok = (index >= 0 && index <= 0xFFFF) && DEBUG_AI_BreakpointDelete((uint16_t)index);
     if (!ok) {
@@ -823,14 +856,18 @@ static std::string ExecBreakpointList(long long id) {
     bool first = true;
     for (uint16_t i = 0; i < count; i++) {
         bool isPhysical = false;
+        bool isRealMemory = false;
+        bool isProtectedMemory = false;
         uint16_t seg = 0;
         uint32_t off = 0;
-        if (!DEBUG_AI_BreakpointInfo(i, isPhysical, seg, off)) continue;
-        if (!isPhysical) continue;  /* interrupt/memory breakpoints: out of scope for Phase 4B */
+        if (!DEBUG_AI_BreakpointInfo(i, isPhysical, isRealMemory,
+                                     isProtectedMemory, seg, off)) continue;
+        if (!isPhysical && !isRealMemory && !isProtectedMemory) continue;
 
-        char item[128];
-        snprintf(item, sizeof(item), "%s{\"id\":%u,\"address\":\"%04X:%04X\",\"enabled\":true}",
-            first ? "" : ",", (unsigned)i, (unsigned)seg, (unsigned)(off & 0xFFFF));
+        char item[176];
+        snprintf(item, sizeof(item), "%s{\"id\":%u,\"address\":\"%04X:%04X\",\"type\":\"%s\",\"enabled\":true}",
+            first ? "" : ",", (unsigned)i, (unsigned)seg, (unsigned)(off & 0xFFFF),
+            isProtectedMemory ? "protected_memory" : (isRealMemory ? "memory" : "code"));
         arr += item;
         first = false;
     }
@@ -855,6 +892,8 @@ static std::string ExecuteRequest(const AIRequestItem &item) {
         case AIMethod::MemoryWrite:      return ExecMemoryWrite(item.id, item.seg, item.off, item.writeBytes);
         case AIMethod::RegisterWrite:    return ExecRegisterWrite(item.id, item.regName, item.regValue);
         case AIMethod::BreakpointSet:     return ExecBreakpointSet(item.id, item.seg, item.off);
+        case AIMethod::ProtectedMemoryBreakpointSet: return ExecProtectedMemoryBreakpointSet(item.id, item.seg, item.off);
+        case AIMethod::RealMemoryBreakpointSet: return ExecRealMemoryBreakpointSet(item.id, item.seg, item.off);
         case AIMethod::BreakpointDelete:  return ExecBreakpointDelete(item.id, item.breakpointIndex);
         case AIMethod::BreakpointList:    return ExecBreakpointList(item.id);
         case AIMethod::ExecutionContinue: return ExecExecutionContinue(item.id);
@@ -1190,6 +1229,26 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
         }
         if (!ParseAddress(itAddr->second.str, item.seg, item.off)) {
             RespondError("INVALID_ADDRESS", "malformed address, expected \"SEG:OFF\" hex"); return;
+        }
+    } else if (method == "breakpoint.memory.set") {
+        item.method = AIMethod::ProtectedMemoryBreakpointSet;
+        if (!params) { RespondError("INVALID_PARAMETER", "breakpoint.memory.set requires \"params\""); return; }
+        auto itAddr = params->object.find("address");
+        if (itAddr == params->object.end() || itAddr->second.type != JsonValue::Type::String) {
+            RespondError("INVALID_PARAMETER", "params.address must be a string"); return;
+        }
+        if (!ParseAddress(itAddr->second.str, item.seg, item.off)) {
+            RespondError("INVALID_ADDRESS", "malformed address, expected \"SELECTOR:OFFSET\" hex"); return;
+        }
+    } else if (method == "breakpoint.memory.real.set") {
+        item.method = AIMethod::RealMemoryBreakpointSet;
+        if (!params) { RespondError("INVALID_PARAMETER", "breakpoint.memory.real.set requires \"params\""); return; }
+        auto itAddr = params->object.find("address");
+        if (itAddr == params->object.end() || itAddr->second.type != JsonValue::Type::String) {
+            RespondError("INVALID_PARAMETER", "params.address must be a string"); return;
+        }
+        if (!ParseAddress(itAddr->second.str, item.seg, item.off)) {
+            RespondError("INVALID_ADDRESS", "malformed address, expected \"SEG:OFFSET\" hex"); return;
         }
     } else if (method == "breakpoint.delete") {
         item.method = AIMethod::BreakpointDelete;

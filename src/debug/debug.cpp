@@ -974,10 +974,13 @@ uint16_t DEBUG_AI_BreakpointCount(void) {
 	return CBreakpoint::GetCount();
 }
 
-bool DEBUG_AI_BreakpointInfo(uint16_t index, bool &isPhysical, uint16_t &seg, uint32_t &off) {
+bool DEBUG_AI_BreakpointInfo(uint16_t index, bool &isPhysical, bool &isRealMemory,
+                             bool &isProtectedMemory, uint16_t &seg, uint32_t &off) {
 	CBreakpoint *bp = CBreakpoint::GetByIndex(index);
 	if (!bp) return false;
 	isPhysical = (bp->GetType() == BKPNT_PHYSICAL);
+	isRealMemory = (bp->GetType() == BKPNT_MEMORY);
+	isProtectedMemory = (bp->GetType() == BKPNT_MEMORY_PROT);
 	seg = bp->GetSegment();
 	off = bp->GetOffset();
 	return true;
@@ -995,6 +998,41 @@ int DEBUG_AI_BreakpointAdd(uint16_t seg, uint32_t off) {
 		if (CBreakpoint::GetByIndex(i) == bp) return (int)i;
 	}
 	return -1; // should not happen -- AddBreakpoint() always inserts into BPoints
+}
+
+int DEBUG_AI_ProtectedMemoryBreakpointAdd(uint16_t selector, uint32_t off) {
+#if C_HEAVY_DEBUG
+	CBreakpoint *bp = CBreakpoint::AddMemBreakpoint(selector, off);
+	if (!bp) return -1;
+	/* BPPM watches for changes, so seed it with the byte visible when the
+	 * watchpoint is created instead of the CBreakpoint default (zero). */
+	bp->SetValue(mem_readb(bp->GetLocation()));
+	bp->SetType(BKPNT_MEMORY_PROT);
+	uint16_t count = CBreakpoint::GetCount();
+	for (uint16_t i = 0; i < count; i++) {
+		if (CBreakpoint::GetByIndex(i) == bp) return (int)i;
+	}
+#else
+	(void)selector;
+	(void)off;
+#endif
+	return -1;
+}
+
+int DEBUG_AI_RealMemoryBreakpointAdd(uint16_t seg, uint32_t off) {
+#if C_HEAVY_DEBUG
+	CBreakpoint *bp = CBreakpoint::AddMemBreakpoint(seg, off);
+	if (!bp) return -1;
+	bp->SetValue(mem_readb(bp->GetLocation()));
+	uint16_t count = CBreakpoint::GetCount();
+	for (uint16_t i = 0; i < count; i++) {
+		if (CBreakpoint::GetByIndex(i) == bp) return (int)i;
+	}
+#else
+	(void)seg;
+	(void)off;
+#endif
+	return -1;
 }
 
 bool DEBUG_AI_BreakpointDelete(uint16_t index) {

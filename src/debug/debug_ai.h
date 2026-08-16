@@ -107,9 +107,12 @@ bool DEBUG_AI_IsDebugRunning(void);
  * breakpoint shifts every later id down by one. Callers should treat an
  * id as valid only until the next breakpoint.set/breakpoint.delete. */
 uint16_t DEBUG_AI_BreakpointCount(void);
-bool DEBUG_AI_BreakpointInfo(uint16_t index, bool &isPhysical, uint16_t &seg, uint32_t &off);
+bool DEBUG_AI_BreakpointInfo(uint16_t index, bool &isPhysical, bool &isRealMemory,
+                             bool &isProtectedMemory, uint16_t &seg, uint32_t &off);
 bool DEBUG_AI_BreakpointExists(uint16_t seg, uint32_t off);
 int DEBUG_AI_BreakpointAdd(uint16_t seg, uint32_t off);
+int DEBUG_AI_ProtectedMemoryBreakpointAdd(uint16_t selector, uint32_t off);
+int DEBUG_AI_RealMemoryBreakpointAdd(uint16_t seg, uint32_t off);
 bool DEBUG_AI_BreakpointDelete(uint16_t index);
 
 /* ------------------------------------------------------------------ */
