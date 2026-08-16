@@ -209,6 +209,34 @@ int32_t DEBUG_AI_DoStepOver(bool &becameAsync);
  * is currently pending completion. */
 void DEBUG_AI_CompletePendingSteps(void);
 
+/* ------------------------------------------------------------------ */
+/* Input injection (Phase 6B)                                          */
+/*                                                                      */
+/* input.key.down/input.key.up/input.key.tap and input.mouse.* inject   */
+/* guest keyboard/mouse input through the SAME internal entry points     */
+/* the real SDL input handlers already use -- KEYBOARD_AddKey()          */
+/* (include/keyboard.h) and Mouse_CursorMoved()/Mouse_ButtonPressed()/   */
+/* Mouse_ButtonReleased() (include/mouse.h). There is no Win32 SendKeys,  */
+/* window-handle/focus manipulation, or GUI automation of DOSBox-X's own  */
+/* window anywhere in this path -- see debug_ai.cpp's "Input injection    */
+/* (Phase 6B)" section for the full design.                               */
+/*                                                                        */
+/* Like pause_execution(), these are only meaningful while guest code is  */
+/* actually running under Normal_Loop() (dosbox.cpp): KEYBOARD_AddKey()   */
+/* and the Mouse_* functions are emulator-thread-only, and Normal_Loop()  */
+/* only has control while the debugger is NOT stopped. So this mirrors    */
+/* g_pendingPauses/DEBUG_AI_CheckPauseRequest() exactly: a socket thread   */
+/* records a request in debug_ai.cpp's g_pendingInputs (entirely private   */
+/* to that file), and DEBUG_AI_CheckPendingInput() -- called from the SAME */
+/* Normal_Loop() hook (dosbox.cpp), right next to                         */
+/* DEBUG_AI_CheckPauseRequest() -- drains it on the emulator thread.       */
+/*                                                                        */
+/* Unlike DEBUG_AI_CheckPauseRequest(), this never needs to enter the      */
+/* debugger or hand off to a different main-loop handler, so it returns    */
+/* void and dosbox.cpp calls it unconditionally every iteration rather     */
+/* than branching on its result. */
+void DEBUG_AI_CheckPendingInput(void);
+
 #endif
 
 #endif

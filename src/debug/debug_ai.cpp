@@ -36,11 +36,15 @@
 #include <atomic>
 #include <chrono>
 #include <algorithm>
+#include <set>
+#include <utility>
 
 #include "regs.h"
 #include "cpu.h"
 #include "mem.h"
 #include "paging.h"
+#include "keyboard.h"
+#include "mouse.h"
 #include "logging.h"
 
 #if defined(WIN32)
@@ -563,6 +567,219 @@ void DEBUG_AI_CompletePendingSteps(void) {
             p.conn->responseReady = true;
         }
         p.conn->cv.notify_all();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Input injection (Phase 6B)                                          */
+/*                                                                      */
+/* key_down/key_up/key_tap and the mouse.* methods inject guest input   */
+/* through the SAME internal entry points the real SDL keyboard/mouse   */
+/* event handlers already use (KEYBOARD_AddKey() in sdlmain.cpp's key   */
+/* handler; Mouse_CursorMoved()/Mouse_ButtonPressed()/                  */
+/* Mouse_ButtonReleased() in its mouse handler) -- there is no Win32     */
+/* SendKeys/window-handle/focus-stealing/GUI-automation involved         */
+/* anywhere in this path, only the guest-facing emulation DOSBox-X's own */
+/* input handling already funnels every real keypress/click through.    */
+/*                                                                       */
+/* Like pause_execution(), these are only meaningful while guest code is */
+/* actually running under Normal_Loop() (dosbox.cpp) -- KEYBOARD_AddKey()*/
+/* and the Mouse_* functions are not safe to call from any other thread, */
+/* and the debugger being stopped means Normal_Loop() does not have      */
+/* control to run the per-iteration hook that drains this queue. So this */
+/* reuses the exact same pattern as g_pendingPauses/                     */
+/* DEBUG_AI_CheckPauseRequest(): requests are recorded here by a socket   */
+/* thread and drained ONLY from DEBUG_AI_CheckPendingInput(), called from */
+/* the SAME Normal_Loop() hook (dosbox.cpp) right next to                */
+/* DEBUG_AI_CheckPauseRequest() -- see include/debug.h.                  */
+/*                                                                       */
+/* Stuck-input cleanup: g_heldKeys/g_heldButtons record, per connection,  */
+/* which keys/buttons a key_down/mouse.button.set(pressed=true) left held */
+/* down. If a connection disconnects (socket EOF, client crash, or a     */
+/* session timeout on the AI harness side) while keys/buttons are still  */
+/* held, ConnectionThreadFunc's disconnect path below enqueues a          */
+/* ReleaseAll request for that connection -- with conn set but             */
+/* expectsResponse=false, since nobody is waiting on a response by then -- */
+/* so the guest never sees a key or button permanently stuck down because  */
+/* the far end went away mid-session. input.release_all exposes the same   */
+/* mechanism directly, for a well-behaved agent to call proactively at the  */
+/* end of a session instead of relying on disconnect alone. */
+/* ------------------------------------------------------------------ */
+
+enum class AIInputOp {
+    KeyDown, KeyUp, KeyTap,
+    MouseMoveRelative, MouseButtonSet, MouseButtonClick,
+    ReleaseAll
+};
+
+struct PendingInputRequest {
+    AIInputOp op = AIInputOp::KeyTap;
+    std::shared_ptr<AIConnection> conn;
+    long long id = 0;
+    bool expectsResponse = true;
+    KBD_KEYS key = KBD_NONE;
+    uint8_t button = 0;
+    bool pressed = false;
+    float dx = 0.0f;
+    float dy = 0.0f;
+};
+
+static std::mutex g_inputMutex;
+static std::deque<PendingInputRequest> g_pendingInputs;
+
+/* Touched ONLY from the emulator thread, inside DEBUG_AI_CheckPendingInput()
+ * -- both maps are private to that function's single caller, so no separate
+ * lock is needed for them beyond g_inputMutex already protecting the queue
+ * that feeds it. */
+static std::map<std::shared_ptr<AIConnection>, std::set<KBD_KEYS>> g_heldKeys;
+static std::map<std::shared_ptr<AIConnection>, std::set<uint8_t>> g_heldButtons;
+
+static void DEBUG_AI_RequestInput(PendingInputRequest req) {
+    std::lock_guard<std::mutex> lk(g_inputMutex);
+    g_pendingInputs.push_back(std::move(req));
+}
+
+/* Mirrors DEBUG_AI_CancelPause(): called by the socket thread after its
+ * wait times out, so a late DEBUG_AI_CheckPendingInput() completion doesn't
+ * write into a response slot a SUBSEQUENT request on the same (now
+ * re-used) connection is waiting on instead. */
+static void DEBUG_AI_CancelInput(const std::shared_ptr<AIConnection> &conn, long long id) {
+    std::lock_guard<std::mutex> lk(g_inputMutex);
+    g_pendingInputs.erase(
+        std::remove_if(g_pendingInputs.begin(), g_pendingInputs.end(),
+                        [&](const PendingInputRequest &r) { return r.conn == conn && r.id == id; }),
+        g_pendingInputs.end());
+}
+
+/* US 104-key layout only for Phase 6B v1 -- Windows keys, F13-F24, and the
+ * Japanese/Korean-specific KBD_KEYS entries are intentionally not mapped
+ * yet (not needed by any currently supported guest workflow, and best
+ * added deliberately, with real test coverage, rather than guessed at
+ * here). Unrecognized names fail closed (INVALID_PARAMETER), never sent as
+ * some best-guess fallback. */
+static bool ParseKeyName(const std::string &name, KBD_KEYS &key) {
+    static const std::pair<const char *, KBD_KEYS> table[] = {
+        {"1",KBD_1},{"2",KBD_2},{"3",KBD_3},{"4",KBD_4},{"5",KBD_5},
+        {"6",KBD_6},{"7",KBD_7},{"8",KBD_8},{"9",KBD_9},{"0",KBD_0},
+        {"q",KBD_q},{"w",KBD_w},{"e",KBD_e},{"r",KBD_r},{"t",KBD_t},
+        {"y",KBD_y},{"u",KBD_u},{"i",KBD_i},{"o",KBD_o},{"p",KBD_p},
+        {"a",KBD_a},{"s",KBD_s},{"d",KBD_d},{"f",KBD_f},{"g",KBD_g},
+        {"h",KBD_h},{"j",KBD_j},{"k",KBD_k},{"l",KBD_l},{"z",KBD_z},
+        {"x",KBD_x},{"c",KBD_c},{"v",KBD_v},{"b",KBD_b},{"n",KBD_n},{"m",KBD_m},
+        {"f1",KBD_f1},{"f2",KBD_f2},{"f3",KBD_f3},{"f4",KBD_f4},
+        {"f5",KBD_f5},{"f6",KBD_f6},{"f7",KBD_f7},{"f8",KBD_f8},
+        {"f9",KBD_f9},{"f10",KBD_f10},{"f11",KBD_f11},{"f12",KBD_f12},
+        {"esc",KBD_esc},{"tab",KBD_tab},{"backspace",KBD_backspace},
+        {"enter",KBD_enter},{"space",KBD_space},
+        {"leftalt",KBD_leftalt},{"rightalt",KBD_rightalt},
+        {"leftctrl",KBD_leftctrl},{"rightctrl",KBD_rightctrl},
+        {"leftshift",KBD_leftshift},{"rightshift",KBD_rightshift},
+        {"capslock",KBD_capslock},{"scrolllock",KBD_scrolllock},{"numlock",KBD_numlock},
+        {"grave",KBD_grave},{"minus",KBD_minus},{"equals",KBD_equals},
+        {"backslash",KBD_backslash},{"leftbracket",KBD_leftbracket},{"rightbracket",KBD_rightbracket},
+        {"semicolon",KBD_semicolon},{"quote",KBD_quote},{"period",KBD_period},
+        {"comma",KBD_comma},{"slash",KBD_slash},
+        {"printscreen",KBD_printscreen},{"pause",KBD_pause},
+        {"insert",KBD_insert},{"home",KBD_home},{"pageup",KBD_pageup},
+        {"delete",KBD_delete},{"end",KBD_end},{"pagedown",KBD_pagedown},
+        {"left",KBD_left},{"up",KBD_up},{"down",KBD_down},{"right",KBD_right},
+        {"kp1",KBD_kp1},{"kp2",KBD_kp2},{"kp3",KBD_kp3},{"kp4",KBD_kp4},{"kp5",KBD_kp5},
+        {"kp6",KBD_kp6},{"kp7",KBD_kp7},{"kp8",KBD_kp8},{"kp9",KBD_kp9},{"kp0",KBD_kp0},
+        {"kpdivide",KBD_kpdivide},{"kpmultiply",KBD_kpmultiply},
+        {"kpminus",KBD_kpminus},{"kpplus",KBD_kpplus},
+        {"kpenter",KBD_kpenter},{"kpperiod",KBD_kpperiod},
+    };
+    for (const auto &e : table) {
+        if (name == e.first) { key = e.second; return true; }
+    }
+    return false;
+}
+
+/* Erases (rather than merely clearing) conn's entries once released, so
+ * g_heldKeys/g_heldButtons don't grow by one entry per connection for the
+ * lifetime of the process -- every connection eventually reaches either an
+ * explicit input.release_all or the disconnect-triggered ReleaseAll above. */
+static void ReleaseAllHeldInput(const std::shared_ptr<AIConnection> &conn) {
+    auto itK = g_heldKeys.find(conn);
+    if (itK != g_heldKeys.end()) {
+        for (KBD_KEYS k : itK->second) KEYBOARD_AddKey(k, false);
+        g_heldKeys.erase(itK);
+    }
+    auto itB = g_heldButtons.find(conn);
+    if (itB != g_heldButtons.end()) {
+        for (uint8_t b : itB->second) Mouse_ButtonReleased(b);
+        g_heldButtons.erase(itB);
+    }
+}
+
+/* Drains every queued key/mouse input request and executes it against the
+ * SAME KEYBOARD_AddKey()/Mouse_*() entry points real SDL input events use.
+ * MUST be called only from the emulator thread, from the Normal_Loop()
+ * per-iteration hook (dosbox.cpp) -- see include/debug.h and the section
+ * comment above. A no-op (and cheap: one lock+empty check) whenever
+ * nothing is pending. */
+void DEBUG_AI_CheckPendingInput(void) {
+    std::deque<PendingInputRequest> pending;
+    {
+        std::lock_guard<std::mutex> lk(g_inputMutex);
+        if (g_pendingInputs.empty()) return;
+        pending.swap(g_pendingInputs);
+    }
+
+    for (PendingInputRequest &r : pending) {
+        char buf[192];
+        buf[0] = '\0';
+
+        switch (r.op) {
+            case AIInputOp::KeyDown:
+                KEYBOARD_AddKey(r.key, true);
+                g_heldKeys[r.conn].insert(r.key);
+                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"pressed\":true}}", r.id);
+                break;
+            case AIInputOp::KeyUp:
+                KEYBOARD_AddKey(r.key, false);
+                g_heldKeys[r.conn].erase(r.key);
+                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"pressed\":false}}", r.id);
+                break;
+            case AIInputOp::KeyTap:
+                KEYBOARD_AddKey(r.key, true);
+                KEYBOARD_AddKey(r.key, false);
+                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"tapped\":true}}", r.id);
+                break;
+            case AIInputOp::MouseMoveRelative:
+                Mouse_CursorMoved(r.dx, r.dy, 0.0f, 0.0f, true);
+                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"moved\":true}}", r.id);
+                break;
+            case AIInputOp::MouseButtonSet:
+                if (r.pressed) {
+                    Mouse_ButtonPressed(r.button);
+                    g_heldButtons[r.conn].insert(r.button);
+                } else {
+                    Mouse_ButtonReleased(r.button);
+                    g_heldButtons[r.conn].erase(r.button);
+                }
+                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"pressed\":%s}}",
+                    r.id, r.pressed ? "true" : "false");
+                break;
+            case AIInputOp::MouseButtonClick:
+                Mouse_ButtonPressed(r.button);
+                Mouse_ButtonReleased(r.button);
+                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"clicked\":true}}", r.id);
+                break;
+            case AIInputOp::ReleaseAll:
+                ReleaseAllHeldInput(r.conn);
+                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"released\":true}}", r.id);
+                break;
+        }
+
+        if (r.conn && r.expectsResponse) {
+            {
+                std::lock_guard<std::mutex> lk(r.conn->mtx);
+                r.conn->responseLine = buf;
+                r.conn->responseReady = true;
+            }
+            r.conn->cv.notify_all();
+        }
     }
 }
 
@@ -1264,6 +1481,130 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
         item.breakpointIndex = bpIndex;
     } else if (method == "breakpoint.list") {
         item.method = AIMethod::BreakpointList;
+    } else if (method == "input.key.down" || method == "input.key.up" || method == "input.key.tap") {
+        /* Cannot go through g_requestQueue/DEBUG_AI_Poll() -- KEYBOARD_AddKey()
+         * must run on the emulator thread, which only reaches the hook that
+         * drains this (DEBUG_AI_CheckPendingInput(), called from
+         * Normal_Loop(), dosbox.cpp) while guest code is actually running,
+         * i.e. exactly while the debugger is NOT stopped -- the opposite
+         * precondition of every g_requestQueue method above. Same wait
+         * pattern as execution.pause, just fed from g_pendingInputs. */
+        if (g_debuggerActive.load()) {
+            RespondError("DEBUGGER_STOPPED",
+                "cannot inject input while the DOSBox-X debugger is stopped; call execution.continue first");
+            return;
+        }
+        if (!params) { RespondError("INVALID_PARAMETER", method + " requires \"params\""); return; }
+        auto itKey = params->object.find("key");
+        if (itKey == params->object.end() || itKey->second.type != JsonValue::Type::String) {
+            RespondError("INVALID_PARAMETER", "params.key must be a string"); return;
+        }
+        KBD_KEYS key;
+        if (!ParseKeyName(itKey->second.str, key)) {
+            RespondError("INVALID_PARAMETER", "unrecognized params.key \"" + itKey->second.str + "\"");
+            return;
+        }
+
+        PendingInputRequest req;
+        req.op  = (method == "input.key.down") ? AIInputOp::KeyDown
+                : (method == "input.key.up")   ? AIInputOp::KeyUp
+                                                : AIInputOp::KeyTap;
+        req.conn = conn;
+        req.id = id;
+        req.key = key;
+
+        LOG(LOG_MISC, LOG_DEBUG)("AI bridge: request id=%lld method=%s", id, method.c_str());
+        {
+            std::lock_guard<std::mutex> lk(conn->mtx);
+            conn->responseReady = false;
+        }
+        DEBUG_AI_RequestInput(req);
+
+        std::unique_lock<std::mutex> lk(conn->mtx);
+        conn->cv.wait_for(lk, std::chrono::seconds(REQUEST_TIMEOUT_SECONDS),
+                           [&] { return conn->responseReady || conn->stopping.load(); });
+        if (conn->responseReady) {
+            std::string resp = conn->responseLine;
+            lk.unlock();
+            SendLine(conn, resp);
+        } else {
+            lk.unlock();
+            DEBUG_AI_CancelInput(conn, id);
+            if (!conn->stopping.load())
+                RespondError("EXECUTION_TIMEOUT", method + " did not complete within the timeout");
+        }
+        return;
+    } else if (method == "input.mouse.move_relative" || method == "input.mouse.button.set" ||
+               method == "input.mouse.button.click" || method == "input.release_all") {
+        if (g_debuggerActive.load()) {
+            RespondError("DEBUGGER_STOPPED",
+                "cannot inject input while the DOSBox-X debugger is stopped; call execution.continue first");
+            return;
+        }
+
+        PendingInputRequest req;
+        req.conn = conn;
+        req.id = id;
+
+        if (method == "input.mouse.move_relative") {
+            if (!params) { RespondError("INVALID_PARAMETER", method + " requires \"params\""); return; }
+            auto itDx = params->object.find("dx");
+            auto itDy = params->object.find("dy");
+            if (itDx == params->object.end() || itDx->second.type != JsonValue::Type::Number ||
+                itDy == params->object.end() || itDy->second.type != JsonValue::Type::Number) {
+                RespondError("INVALID_PARAMETER", "params.dx and params.dy must both be numbers"); return;
+            }
+            req.op = AIInputOp::MouseMoveRelative;
+            req.dx = (float)itDx->second.number;
+            req.dy = (float)itDy->second.number;
+        } else if (method == "input.release_all") {
+            req.op = AIInputOp::ReleaseAll;
+        } else {
+            if (!params) { RespondError("INVALID_PARAMETER", method + " requires \"params\""); return; }
+            auto itButton = params->object.find("button");
+            if (itButton == params->object.end() || itButton->second.type != JsonValue::Type::Number) {
+                RespondError("INVALID_PARAMETER", "params.button must be a number"); return;
+            }
+            long long button = (long long)itButton->second.number;
+            if (button < 0 || button > 2) {
+                RespondError("INVALID_PARAMETER", "params.button must be 0 (left), 1 (right), or 2 (middle)");
+                return;
+            }
+            req.button = (uint8_t)button;
+
+            if (method == "input.mouse.button.set") {
+                auto itPressed = params->object.find("pressed");
+                if (itPressed == params->object.end() || itPressed->second.type != JsonValue::Type::Bool) {
+                    RespondError("INVALID_PARAMETER", "params.pressed must be a boolean"); return;
+                }
+                req.op = AIInputOp::MouseButtonSet;
+                req.pressed = itPressed->second.number != 0;
+            } else {
+                req.op = AIInputOp::MouseButtonClick;
+            }
+        }
+
+        LOG(LOG_MISC, LOG_DEBUG)("AI bridge: request id=%lld method=%s", id, method.c_str());
+        {
+            std::lock_guard<std::mutex> lk(conn->mtx);
+            conn->responseReady = false;
+        }
+        DEBUG_AI_RequestInput(req);
+
+        std::unique_lock<std::mutex> lk(conn->mtx);
+        conn->cv.wait_for(lk, std::chrono::seconds(REQUEST_TIMEOUT_SECONDS),
+                           [&] { return conn->responseReady || conn->stopping.load(); });
+        if (conn->responseReady) {
+            std::string resp = conn->responseLine;
+            lk.unlock();
+            SendLine(conn, resp);
+        } else {
+            lk.unlock();
+            DEBUG_AI_CancelInput(conn, id);
+            if (!conn->stopping.load())
+                RespondError("EXECUTION_TIMEOUT", method + " did not complete within the timeout");
+        }
+        return;
     } else {
         RespondError("UNKNOWN_METHOD", "unknown method \"" + method + "\"");
         return;
@@ -1343,6 +1684,23 @@ static void ConnectionThreadFunc(std::shared_ptr<AIConnection> conn) {
     }
 
     LOG(LOG_MISC, LOG_NORMAL)("AI bridge: client disconnected");
+
+    /* Phase 6B: if this connection left any key/mouse button held down
+     * (key_down/mouse.button.set without a matching release before the
+     * client disconnected, crashed, or hit a session timeout), release it
+     * now rather than leaving the guest with a permanently "stuck" input --
+     * see the "Input injection (Phase 6B)" section above. This only
+     * enqueues the release; expectsResponse=false because nobody is
+     * waiting on conn's response slot by this point, and it still only
+     * actually runs once DEBUG_AI_CheckPendingInput() next drains the
+     * queue on the emulator thread. */
+    {
+        PendingInputRequest release;
+        release.op = AIInputOp::ReleaseAll;
+        release.conn = conn;
+        release.expectsResponse = false;
+        DEBUG_AI_RequestInput(release);
+    }
 
     if (conn->sock != AI_INVALID_SOCKET) {
         ai_close(conn->sock);

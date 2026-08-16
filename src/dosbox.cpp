@@ -532,6 +532,14 @@ static Bitu Normal_Loop(void) {
                  * src/debug/debug_ai.h for the full design. */
                 if (DEBUG_AI_CheckPauseRequest())
                     return 0;
+                /* Phase 6B (DOSBox-X-AI project): the ONLY point at which
+                 * queued AI bridge key/mouse input injection requests can
+                 * actually reach KEYBOARD_AddKey()/Mouse_*() -- see
+                 * src/debug/debug_ai.h for the full design. Unlike the
+                 * pause check above, this never hands control to a
+                 * different main-loop handler, so it doesn't gate the
+                 * loop's return. */
+                DEBUG_AI_CheckPendingInput();
 #endif
             } else {
                 GFX_Events();

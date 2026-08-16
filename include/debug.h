@@ -41,6 +41,18 @@ bool DEBUG_AI_CheckPauseRequest(void);
  * src/debug/debug_ai.h for the full Phase 4C design. */
 void DEBUG_AI_SetDebuggerActive(bool active);
 
+/* Phase 6B (DOSBox-X-AI project, src/debug/debug_ai.cpp): drains any
+ * queued key/mouse input injection requests (the input.key.* and
+ * input.mouse.* methods) and executes them via KEYBOARD_AddKey() and the
+ * Mouse_* functions -- the SAME internal entry points real SDL input
+ * events use. Defined in debug_ai.cpp;
+ * declared again here (as well as in debug_ai.h) so dosbox.cpp -- which
+ * already includes this header, not debug_ai.h -- can call it from
+ * Normal_Loop() without a new include dependency, right alongside
+ * DEBUG_AI_CheckPauseRequest() above. See src/debug/debug_ai.h for the
+ * full Phase 6B design. */
+void DEBUG_AI_CheckPendingInput(void);
+
 extern Bitu cycle_count;
 extern Bitu debugCallback;
 
