@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <set>
 #include <utility>
+#include <cmath>
 
 #include "regs.h"
 #include "cpu.h"
@@ -46,6 +47,13 @@
 #include "keyboard.h"
 #include "mouse.h"
 #include "logging.h"
+#include "pic.h"
+#include "hardware.h"
+
+#if (C_SSHOT)
+#include <zlib.h>
+#include <png.h>
+#endif
 
 #if defined(WIN32)
 #include <winsock2.h>
@@ -91,6 +99,7 @@ static const size_t   MAX_LINE_LENGTH        = 8192;
 static const long long MAX_READ_LENGTH       = 65536;
 static const long long MAX_WRITE_LENGTH      = 65536;
 static const long long MAX_DISASSEMBLE_COUNT = 100;
+static const size_t    MAX_FRAME_PAYLOAD_BYTES = 8 * 1024 * 1024;
 static const int       REQUEST_TIMEOUT_SECONDS = 5;
 
 /* Phase 4A: registers writable through register.write. EIP, all segment
@@ -779,6 +788,366 @@ void DEBUG_AI_CheckPendingInput(void) {
                 r.conn->responseReady = true;
             }
             r.conn->cv.notify_all();
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Frame capture (Phase 7A)                                            */
+/*                                                                      */
+/* video.frame.capture returns a PNG or raw RGBA8888 snapshot of        */
+/* exactly the guest's own rendered frame -- never the DOSBox-X window, */
+/* the SDL/GL surface as presented, or the host desktop. It reuses      */
+/* DOSBox-X's OWN existing screenshot/AVI mechanism's hook point rather  */
+/* than inventing a new one: RENDER_EndUpdate() (src/gui/render.cpp)     */
+/* already hands the pre-scaler, pre-backend frame                      */
+/* (scalerSourceCacheBuffer) to CAPTURE_AddImage() (src/hardware/        */
+/* hardware.cpp) whenever a Host+P screenshot or AVI recording is        */
+/* pending -- confirmed backend-agnostic (the SAME call site regardless  */
+/* of software/OpenGL/Direct3D/Voodoo output) by docs/                   */
+/* phase7a-frame-capture-design.md's source investigation. This adds a   */
+/* second, independent check at that exact same site, so a pending AI    */
+/* bridge capture request is serviced the moment a frame is genuinely    */
+/* rendered, without waiting for or depending on the user's own          */
+/* screenshot feature.                                                   */
+/*                                                                       */
+/* Thread: RENDER_EndUpdate() runs on the emulator thread (PIC-event-    */
+/* driven from the VGA draw routines, per the design doc's                */
+/* investigation) -- the SAME thread Phase 6B's KEYBOARD_AddKey()/        */
+/* Mouse_*() calls are already safe on. So this reuses the identical      */
+/* "pending request recorded by a socket thread, drained on the emulator  */
+/* thread" pattern as g_pendingPauses/g_pendingInputs, just with a NEW    */
+/* drain site (DEBUG_AI_CheckPendingFrameCapture(), called from           */
+/* RENDER_EndUpdate() -- see include/debug.h) instead of Normal_Loop()'s  */
+/* existing hook, since RENDER_EndUpdate() is the only place              */
+/* scalerSourceCacheBuffer is valid before the next frame overwrites it.  */
+/*                                                                       */
+/* Unlike a screenshot, nothing here is ever written to disk -- PNG       */
+/* encoding goes through libpng's png_set_write_fn() into an in-memory    */
+/* buffer, bypassing CAPTURE_AddImage()'s own OpenCaptureFile() entirely,  */
+/* so an agent calling this repeatedly never fills the user's own          */
+/* screenshot folder.                                                     */
+/* ------------------------------------------------------------------ */
+
+struct PendingFrameCapture {
+    std::shared_ptr<AIConnection> conn;
+    long long id = 0;
+    bool wantPng = true;       /* false => raw rgba8888 */
+    uint32_t maxWidth = 0;     /* 0 = no limit (native size) */
+    uint32_t maxHeight = 0;
+};
+
+static std::mutex                        g_frameCaptureMutex;
+static std::deque<PendingFrameCapture>    g_pendingFrameCaptures;
+static std::atomic<bool>                  g_frameCapturePending{false};
+static std::atomic<uint64_t>              g_nextFrameId{1};
+
+static void DEBUG_AI_RequestFrameCapture(PendingFrameCapture req) {
+    std::lock_guard<std::mutex> lk(g_frameCaptureMutex);
+    g_pendingFrameCaptures.push_back(std::move(req));
+    g_frameCapturePending.store(true, std::memory_order_release);
+}
+
+/* Mirrors DEBUG_AI_CancelPause()/DEBUG_AI_CancelInput() -- called by the
+ * socket thread after its wait times out, so a late frame-capture
+ * completion doesn't write into a response slot a SUBSEQUENT request on
+ * the same (now re-used) connection is waiting on instead. */
+static void DEBUG_AI_CancelFrameCapture(const std::shared_ptr<AIConnection> &conn, long long id) {
+    std::lock_guard<std::mutex> lk(g_frameCaptureMutex);
+    g_pendingFrameCaptures.erase(
+        std::remove_if(g_pendingFrameCaptures.begin(), g_pendingFrameCaptures.end(),
+                        [&](const PendingFrameCapture &r) { return r.conn == conn && r.id == id; }),
+        g_pendingFrameCaptures.end());
+    if (g_pendingFrameCaptures.empty())
+        g_frameCapturePending.store(false, std::memory_order_release);
+}
+
+static std::string Base64Encode(const uint8_t *data, size_t len) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    size_t i = 0;
+    for (; i + 3 <= len; i += 3) {
+        uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8) | data[i + 2];
+        out += table[(n >> 18) & 0x3F];
+        out += table[(n >> 12) & 0x3F];
+        out += table[(n >> 6) & 0x3F];
+        out += table[n & 0x3F];
+    }
+    size_t rem = len - i;
+    if (rem == 1) {
+        uint32_t n = (uint32_t)data[i] << 16;
+        out += table[(n >> 18) & 0x3F];
+        out += table[(n >> 12) & 0x3F];
+        out += "==";
+    } else if (rem == 2) {
+        uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8);
+        out += table[(n >> 18) & 0x3F];
+        out += table[(n >> 12) & 0x3F];
+        out += table[(n >> 6) & 0x3F];
+        out += "=";
+    }
+    return out;
+}
+
+/* Unpacks one frame's worth of guest pixel data (native bpp 8/15/16/24/32,
+ * as produced by the VGA draw handlers into scalerSourceCacheBuffer) into
+ * a freshly allocated, top-to-bottom RGBA8888 buffer, applying
+ * CAPTURE_FLAG_DBLW/DBLH the same way CAPTURE_AddImage() does (Phase 7A
+ * design doc). Unlike CAPTURE_AddImage()'s own scratch buffer, this
+ * writes straight into R,G,B,A order throughout -- CAPTURE_AddImage()'s
+ * BGR-looking byte order only comes out correct there because of a
+ * downstream png_set_bgr() call this function does not have (see the
+ * design doc's "byte-order note"). The alpha channel is always 0xFF --
+ * the guest has no concept of transparency. */
+static std::vector<uint8_t> UnpackFrameToRGBA8888(Bitu width, Bitu height, Bitu bpp,
+        Bitu pitch, Bitu flags, const uint8_t *data, const uint8_t *pal,
+        Bitu &outWidth, Bitu &outHeight) {
+    const bool dblw = (flags & CAPTURE_FLAG_DBLW) != 0;
+    const bool dblh = (flags & CAPTURE_FLAG_DBLH) != 0;
+    Bitu outW = width * (dblw ? 2 : 1);
+    Bitu outH = height * (dblh ? 2 : 1);
+    outWidth = outW;
+    outHeight = outH;
+
+    std::vector<uint8_t> out((size_t)outW * (size_t)outH * 4);
+
+    for (Bitu y = 0; y < outH; y++) {
+        Bitu srcY = dblh ? (y >> 1) : y;
+        const uint8_t *srcLine = data + srcY * pitch;
+        uint8_t *dstLine = out.data() + (size_t)y * outW * 4;
+
+        for (Bitu x = 0; x < width; x++) {
+            uint8_t r = 0, g = 0, b = 0;
+            switch (bpp) {
+                case 8: {
+                    uint8_t idx = srcLine[x];
+                    r = pal[(size_t)idx * 4 + 0];
+                    g = pal[(size_t)idx * 4 + 1];
+                    b = pal[(size_t)idx * 4 + 2];
+                    break;
+                }
+                case 15: {
+                    uint16_t pixel = ((const uint16_t *)srcLine)[x];
+                    r = (uint8_t)(((pixel & 0x7c00u) * 0x21u) >> 12);
+                    g = (uint8_t)(((pixel & 0x03e0u) * 0x21u) >> 7);
+                    b = (uint8_t)(((pixel & 0x001fu) * 0x21u) >> 2);
+                    break;
+                }
+                case 16: {
+                    uint16_t pixel = ((const uint16_t *)srcLine)[x];
+                    r = (uint8_t)(((pixel & 0xf800u) * 0x21u) >> 13);
+                    g = (uint8_t)(((pixel & 0x07e0u) * 0x41u) >> 9);
+                    b = (uint8_t)(((pixel & 0x001fu) * 0x21u) >> 2);
+                    break;
+                }
+                case 24: {
+                    const uint8_t *p = srcLine + (size_t)x * 3;
+                    b = p[0]; g = p[1]; r = p[2]; /* source stored B,G,R */
+                    break;
+                }
+                case 32:
+                default: {
+                    const uint8_t *p = srcLine + (size_t)x * 4;
+                    b = p[0]; g = p[1]; r = p[2]; /* source stored B,G,R,(unused) */
+                    break;
+                }
+            }
+
+            uint8_t *dst = dstLine + (size_t)x * 4;
+            dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = 0xFF;
+
+            if (dblw) {
+                uint8_t *dst2 = dstLine + ((size_t)x * 2 + 1) * 4;
+                dst2[0] = r; dst2[1] = g; dst2[2] = b; dst2[3] = 0xFF;
+            }
+        }
+    }
+
+    return out;
+}
+
+/* Simple nearest-neighbor downscale for max_width/max_height, per the
+ * Phase 7A design doc's "high quality or a clearly documented
+ * nearest-neighbor rule" allowance. Preserves aspect ratio -- the
+ * smaller of the two implied scale factors wins. A no-op (returns the
+ * input unchanged) if the image already fits. */
+static std::vector<uint8_t> ScaleRGBA8888NearestNeighbor(const std::vector<uint8_t> &src,
+        Bitu srcW, Bitu srcH, uint32_t maxW, uint32_t maxH, Bitu &outW, Bitu &outH) {
+    double scale = 1.0;
+    if (maxW && srcW > maxW) scale = std::min<double>(scale, (double)maxW / (double)srcW);
+    if (maxH && srcH > maxH) scale = std::min<double>(scale, (double)maxH / (double)srcH);
+
+    if (scale >= 1.0) {
+        outW = srcW;
+        outH = srcH;
+        return src;
+    }
+
+    outW = std::max<Bitu>(1, (Bitu)((double)srcW * scale));
+    outH = std::max<Bitu>(1, (Bitu)((double)srcH * scale));
+
+    std::vector<uint8_t> out((size_t)outW * (size_t)outH * 4);
+    for (Bitu y = 0; y < outH; y++) {
+        Bitu srcY = std::min<Bitu>(srcH - 1, (Bitu)((double)y * srcH / outH));
+        for (Bitu x = 0; x < outW; x++) {
+            Bitu srcX = std::min<Bitu>(srcW - 1, (Bitu)((double)x * srcW / outW));
+            const uint8_t *s = src.data() + ((size_t)srcY * srcW + srcX) * 4;
+            uint8_t *d = out.data() + ((size_t)y * outW + x) * 4;
+            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+        }
+    }
+    return out;
+}
+
+#if (C_SSHOT)
+namespace {
+struct PngMemoryWriter {
+    std::vector<uint8_t> buffer;
+};
+}
+
+static void PngWriteCallback(png_structp png_ptr, png_bytep data, png_size_t length) {
+    PngMemoryWriter *writer = (PngMemoryWriter *)png_get_io_ptr(png_ptr);
+    writer->buffer.insert(writer->buffer.end(), data, data + length);
+}
+
+static void PngFlushCallback(png_structp) { /* nothing to flush -- in-memory only */ }
+
+/* Encodes an RGBA8888 buffer to PNG entirely in memory -- deliberately
+ * NOT reusing CAPTURE_AddImage()'s OpenCaptureFile()-based path, so this
+ * never touches the user's own screenshot directory (see the section
+ * comment above). */
+static bool EncodeRGBA8888AsPng(const std::vector<uint8_t> &rgba, Bitu width, Bitu height,
+        std::vector<uint8_t> &outPng) {
+    png_structp png_ptr = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png_ptr) return false;
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) {
+        png_destroy_write_struct(&png_ptr, nullptr);
+        return false;
+    }
+
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        png_destroy_write_struct(&png_ptr, &info_ptr);
+        return false;
+    }
+
+    PngMemoryWriter writer;
+    png_set_write_fn(png_ptr, &writer, PngWriteCallback, PngFlushCallback);
+
+    png_set_IHDR(png_ptr, info_ptr, (png_uint_32)width, (png_uint_32)height, 8,
+        PNG_COLOR_TYPE_RGB_ALPHA, PNG_INTERLACE_NONE,
+        PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png_ptr, info_ptr);
+
+    std::vector<png_bytep> rows(height);
+    for (Bitu y = 0; y < height; y++)
+        rows[y] = (png_bytep)(rgba.data() + (size_t)y * width * 4);
+    png_write_image(png_ptr, rows.data());
+    png_write_end(png_ptr, nullptr);
+
+    png_destroy_write_struct(&png_ptr, &info_ptr);
+    outPng = std::move(writer.buffer);
+    return true;
+}
+#endif
+
+/* Builds the response for exactly one pending capture request against an
+ * already-unpacked (and possibly already-scaled) RGBA8888 buffer. Split
+ * out of DEBUG_AI_CheckPendingFrameCapture() below purely so each of its
+ * several failure/success outcomes can use a plain `return` instead of
+ * threading extra state through the loop body. */
+static std::string BuildFrameCaptureResponse(const PendingFrameCapture &req,
+        const std::vector<uint8_t> &finalRgba, Bitu outW, Bitu outH,
+        uint64_t frameId, uint64_t emulatedMs) {
+    const std::vector<uint8_t> *encoded = &finalRgba;
+    std::vector<uint8_t> pngBytes;
+    const char *payloadField = req.wantPng ? "png_base64" : "rgba_base64";
+
+#if (C_SSHOT)
+    if (req.wantPng) {
+        if (!EncodeRGBA8888AsPng(finalRgba, outW, outH, pngBytes)) {
+            return "{\"id\":" + std::to_string(req.id) +
+                ",\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"PNG encoding failed\"}}";
+        }
+        encoded = &pngBytes;
+    }
+#else
+    if (req.wantPng) {
+        return "{\"id\":" + std::to_string(req.id) +
+            ",\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"this build has no PNG support (C_SSHOT=0); use format=\\\"rgba\\\"\"}}";
+    }
+#endif
+
+    if (encoded->size() > MAX_FRAME_PAYLOAD_BYTES) {
+        /* Byte count is exact for rgba, and a reasonable (never an
+         * under-estimate) basis for png too -- PNG compresses, so this
+         * suggestion errs toward "smaller than strictly necessary" rather
+         * than one that could still exceed the cap. */
+        double scale = std::sqrt((double)MAX_FRAME_PAYLOAD_BYTES / (double)encoded->size());
+        Bitu suggestedW = std::max<Bitu>(1, (Bitu)((double)outW * scale));
+        Bitu suggestedH = std::max<Bitu>(1, (Bitu)((double)outH * scale));
+        return "{\"id\":" + std::to_string(req.id) +
+            ",\"ok\":false,\"error\":{\"code\":\"FRAME_TOO_LARGE\",\"message\":\"encoded frame exceeds the " +
+            std::to_string(MAX_FRAME_PAYLOAD_BYTES) + "-byte cap\",\"suggested_max_width\":" +
+            std::to_string(suggestedW) + ",\"suggested_max_height\":" + std::to_string(suggestedH) + "}}";
+    }
+
+    return "{\"id\":" + std::to_string(req.id) + ",\"ok\":true,\"result\":{"
+        "\"frame_id\":" + std::to_string(frameId) + ","
+        "\"width\":" + std::to_string(outW) + ","
+        "\"height\":" + std::to_string(outH) + ","
+        "\"pixel_format\":\"rgba8888\","
+        "\"cursor_included\":false,"
+        "\"captured_at_emulated_ms\":" + std::to_string(emulatedMs) + ","
+        "\"" + std::string(payloadField) + "\":\"" + Base64Encode(encoded->data(), encoded->size()) + "\"}}";
+}
+
+/* Drains every queued video.frame.capture request against THIS rendered
+ * frame's data. MUST be called only from RENDER_EndUpdate()
+ * (src/gui/render.cpp), i.e. only from the emulator thread -- see
+ * include/debug.h and the section comment above. Cheap (a single relaxed
+ * atomic load) whenever nothing is pending -- safe to call
+ * unconditionally on every rendered frame, the same way
+ * DEBUG_AI_CheckPendingInput() is called unconditionally every
+ * Normal_Loop() iteration. */
+void DEBUG_AI_CheckPendingFrameCapture(Bitu width, Bitu height, Bitu bpp, Bitu pitch,
+        Bitu flags, const uint8_t *data, const uint8_t *pal) {
+    if (!g_frameCapturePending.load(std::memory_order_acquire)) return;
+
+    std::deque<PendingFrameCapture> pending;
+    {
+        std::lock_guard<std::mutex> lk(g_frameCaptureMutex);
+        pending.swap(g_pendingFrameCaptures);
+        g_frameCapturePending.store(false, std::memory_order_release);
+    }
+    if (pending.empty()) return;
+
+    Bitu nativeW = 0, nativeH = 0;
+    std::vector<uint8_t> rgba = UnpackFrameToRGBA8888(width, height, bpp, pitch, flags, data, pal, nativeW, nativeH);
+
+    uint64_t frameId = g_nextFrameId.fetch_add(1);
+    uint64_t emulatedMs = (uint64_t)(PIC_FullIndex());
+
+    for (PendingFrameCapture &req : pending) {
+        Bitu outW = nativeW, outH = nativeH;
+        const std::vector<uint8_t> *finalRgba = &rgba;
+        std::vector<uint8_t> scaled;
+        if (req.maxWidth || req.maxHeight) {
+            scaled = ScaleRGBA8888NearestNeighbor(rgba, nativeW, nativeH, req.maxWidth, req.maxHeight, outW, outH);
+            finalRgba = &scaled;
+        }
+
+        std::string resp = BuildFrameCaptureResponse(req, *finalRgba, outW, outH, frameId, emulatedMs);
+
+        if (req.conn) {
+            {
+                std::lock_guard<std::mutex> lk(req.conn->mtx);
+                req.conn->responseLine = resp;
+                req.conn->responseReady = true;
+            }
+            req.conn->cv.notify_all();
         }
     }
 }
@@ -1603,6 +1972,79 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
             DEBUG_AI_CancelInput(conn, id);
             if (!conn->stopping.load())
                 RespondError("EXECUTION_TIMEOUT", method + " did not complete within the timeout");
+        }
+        return;
+    } else if (method == "video.frame.capture") {
+        /* Unlike input.*, this does NOT require the debugger to be
+         * running: DEBUG_AI_CheckPendingFrameCapture() (debug_ai.cpp) is
+         * drained from RENDER_EndUpdate() (render.cpp), which still runs
+         * while the guest is stopped IF a frame happens to render before
+         * the request times out -- but in practice a fully halted guest
+         * (stopped at a breakpoint) is not producing new VGA frames via
+         * PIC-driven vertical retrace, so a request issued while stopped
+         * will typically wait out the full timeout unless execution
+         * resumes in the meantime. That is expected, documented behavior
+         * (see docs/phase7a-frame-capture-design.md), not a bug -- it is
+         * intentionally NOT rejected outright the way input.* methods
+         * reject DEBUGGER_STOPPED, since a capture is still meaningful
+         * (if slow) around a resume. */
+        PendingFrameCapture req;
+        req.conn = conn;
+        req.id = id;
+
+        if (!params) { RespondError("INVALID_PARAMETER", "video.frame.capture requires \"params\""); return; }
+        auto itFormat = params->object.find("format");
+        if (itFormat == params->object.end() || itFormat->second.type != JsonValue::Type::String) {
+            RespondError("INVALID_PARAMETER", "params.format must be a string"); return;
+        }
+        if (itFormat->second.str == "png") req.wantPng = true;
+        else if (itFormat->second.str == "rgba") req.wantPng = false;
+        else { RespondError("INVALID_PARAMETER", "params.format must be \"png\" or \"rgba\""); return; }
+
+        auto itCursor = params->object.find("include_cursor");
+        if (itCursor != params->object.end() && itCursor->second.type == JsonValue::Type::Bool &&
+            itCursor->second.number != 0) {
+            /* Phase 7A design doc section "Open questions": cursor
+             * compositing isn't implemented yet -- fail closed rather
+             * than silently ignoring the request or claiming a cursor
+             * that isn't really there. */
+            RespondError("INVALID_PARAMETER", "include_cursor=true is not yet supported"); return;
+        }
+
+        auto itMaxW = params->object.find("max_width");
+        if (itMaxW != params->object.end() && itMaxW->second.type == JsonValue::Type::Number) {
+            long long mw = (long long)itMaxW->second.number;
+            if (mw <= 0 || mw > 0x7FFFFFFFLL) { RespondError("INVALID_PARAMETER", "params.max_width out of range"); return; }
+            req.maxWidth = (uint32_t)mw;
+        }
+        auto itMaxH = params->object.find("max_height");
+        if (itMaxH != params->object.end() && itMaxH->second.type == JsonValue::Type::Number) {
+            long long mh = (long long)itMaxH->second.number;
+            if (mh <= 0 || mh > 0x7FFFFFFFLL) { RespondError("INVALID_PARAMETER", "params.max_height out of range"); return; }
+            req.maxHeight = (uint32_t)mh;
+        }
+
+        LOG(LOG_MISC, LOG_DEBUG)("AI bridge: request id=%lld method=%s", id, method.c_str());
+        {
+            std::lock_guard<std::mutex> lk(conn->mtx);
+            conn->responseReady = false;
+        }
+        DEBUG_AI_RequestFrameCapture(req);
+
+        std::unique_lock<std::mutex> lk(conn->mtx);
+        conn->cv.wait_for(lk, std::chrono::seconds(REQUEST_TIMEOUT_SECONDS),
+                           [&] { return conn->responseReady || conn->stopping.load(); });
+        if (conn->responseReady) {
+            std::string resp = conn->responseLine;
+            lk.unlock();
+            SendLine(conn, resp);
+        } else {
+            lk.unlock();
+            DEBUG_AI_CancelFrameCapture(conn, id);
+            if (!conn->stopping.load())
+                RespondError("EXECUTION_TIMEOUT",
+                    "video.frame.capture did not complete within the timeout -- no frame was "
+                    "rendered in time (is the guest currently running and producing video output?)");
         }
         return;
     } else {

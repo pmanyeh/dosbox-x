@@ -53,6 +53,20 @@ void DEBUG_AI_SetDebuggerActive(bool active);
  * full Phase 6B design. */
 void DEBUG_AI_CheckPendingInput(void);
 
+/* Phase 7A (DOSBox-X-AI project, src/debug/debug_ai.cpp): if an AI
+ * bridge video.frame.capture request is pending, encodes this frame's
+ * data (from CAPTURE_AddImage()'s own pre-scaler, pre-backend source --
+ * see docs/phase7a-frame-capture-design.md) and completes it. Defined in
+ * debug_ai.cpp; declared again here (as well as in debug_ai.h) so
+ * render.cpp -- which does not otherwise depend on src/debug/ -- can
+ * call it from RENDER_EndUpdate() without a new include dependency,
+ * right where CAPTURE_AddImage() is already called for the SAME reason
+ * (this is the only point scalerSourceCacheBuffer is valid for this
+ * frame). Cheap (a single atomic check) whenever no capture is pending
+ * -- safe to call unconditionally on every rendered frame. */
+void DEBUG_AI_CheckPendingFrameCapture(Bitu width, Bitu height, Bitu bpp, Bitu pitch,
+    Bitu flags, const uint8_t *data, const uint8_t *pal);
+
 extern Bitu cycle_count;
 extern Bitu debugCallback;
 

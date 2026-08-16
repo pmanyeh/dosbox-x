@@ -27,6 +27,7 @@
 #include "logging.h"
 #include "video.h"
 #include "render.h"
+#include "debug.h"
 #include "setup.h"
 #include "control.h"
 #include "mapper.h"
@@ -506,6 +507,29 @@ void RENDER_EndUpdate( bool abort ) {
             CAPTURE_AddImage( render.src.width, render.src.height, render.src.bpp, pitch,
                 flags, fps, (uint8_t*)scalerSourceCacheBuffer, (uint8_t*)&render.pal.rgb );
         }
+#if C_DEBUG
+        /* Phase 7A (DOSBox-X-AI project): the ONLY point at which a queued
+         * AI bridge video.frame.capture() request can actually reach a
+         * real, valid frame -- scalerSourceCacheBuffer is only valid here,
+         * before the next frame overwrites it, and this hook must run
+         * whether or not the user's OWN screenshot/video capture
+         * (CaptureState above) happens to be active right now. Computed
+         * independently of that block's own pitch/flags rather than
+         * sharing them, so this cannot be affected by (or accidentally
+         * affect) the user-facing screenshot/AVI feature. See
+         * src/debug/debug_ai.h and docs/phase7a-frame-capture-design.md
+         * for the full design. */
+        {
+            Bitu aiFlags = 0;
+            if (render.src.dblw != render.src.dblh) {
+                if (render.src.dblw) aiFlags |= CAPTURE_FLAG_DBLW;
+                if (render.src.dblh) aiFlags |= CAPTURE_FLAG_DBLH;
+            }
+            DEBUG_AI_CheckPendingFrameCapture(render.src.width, render.src.height, render.src.bpp,
+                render.scale.cachePitch, aiFlags, (uint8_t*)scalerSourceCacheBuffer,
+                (uint8_t*)&render.pal.rgb);
+        }
+#endif
         if ( render.scale.outWrite) {
             GFX_EndUpdate( abort? NULL : Scaler_ChangedLines );
             render.frameskip.hadSkip[render.frameskip.index] = 0;

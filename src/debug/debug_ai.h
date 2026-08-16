@@ -237,6 +237,38 @@ void DEBUG_AI_CompletePendingSteps(void);
 /* than branching on its result. */
 void DEBUG_AI_CheckPendingInput(void);
 
+/* ------------------------------------------------------------------ */
+/* Frame capture (Phase 7A)                                            */
+/*                                                                      */
+/* video.frame.capture returns a PNG/RGBA8888 snapshot of exactly the   */
+/* guest's own rendered frame -- never the DOSBox-X window, the SDL/GL   */
+/* surface as presented, or the host desktop -- by reusing the SAME      */
+/* internal hook point DOSBox-X's own Host+P screenshot and AVI          */
+/* recording already use: RENDER_EndUpdate() (src/gui/render.cpp) hands  */
+/* the pre-scaler, pre-backend frame (scalerSourceCacheBuffer) to        */
+/* CAPTURE_AddImage() (src/hardware/hardware.cpp) whenever a screenshot   */
+/* or recording is pending; this adds a second, independent check at      */
+/* that exact same site, confirmed backend-agnostic (the SAME call site   */
+/* regardless of active software/OpenGL/Direct3D/Voodoo output) by        */
+/* docs/phase7a-frame-capture-design.md's source investigation. See       */
+/* debug_ai.cpp's "Frame capture (Phase 7A)" section for the full         */
+/* design, including why nothing here is ever written to disk.            */
+/*                                                                        */
+/* RENDER_EndUpdate() runs on the emulator thread (PIC-event-driven from  */
+/* the VGA draw routines) -- the SAME thread Phase 6B's                   */
+/* KEYBOARD_AddKey()/Mouse_*() calls are already safe on. So this mirrors */
+/* g_pendingInputs/DEBUG_AI_CheckPendingInput() exactly: a socket thread   */
+/* records a request in debug_ai.cpp's g_pendingFrameCaptures (entirely   */
+/* private to that file), and DEBUG_AI_CheckPendingFrameCapture() --      */
+/* called from RENDER_EndUpdate() (render.cpp), NOT from Normal_Loop()'s  */
+/* hook, since RENDER_EndUpdate() is the only place                       */
+/* scalerSourceCacheBuffer is valid for this frame -- drains it on the    */
+/* emulator thread. Cheap (a single relaxed atomic load) whenever          */
+/* nothing is pending, since it is called on every rendered frame,        */
+/* far more often than Normal_Loop()'s own per-iteration hook. */
+void DEBUG_AI_CheckPendingFrameCapture(Bitu width, Bitu height, Bitu bpp, Bitu pitch,
+    Bitu flags, const uint8_t *data, const uint8_t *pal);
+
 #endif
 
 #endif
