@@ -7604,7 +7604,18 @@ bool DOSBOX_parse_argv() {
         }
         else if (optname == "defaultdir") {
             control->opt_used_defaultdir = true;
-            if (control->cmdline->NextOptArgv(tmp)) {
+            /* -defaultdir takes an OPTIONAL path argument, unlike most other
+             * options here that require one. NextOptArgv() has no concept of
+             * "optional" -- it will happily hand back the next token even if
+             * that token is actually the next "-switch" on the command line,
+             * silently eating it (and everything the parser would otherwise
+             * have done with it) as a bogus directory name. Peek first and
+             * only consume the token as our argument if it doesn't itself
+             * look like another option. */
+            std::string peek;
+            control->cmdline->GetCurrentArgv(peek);
+            bool nextLooksLikeOption = !peek.empty() && (peek[0] == '-' || peek[0] == '/');
+            if (!nextLooksLikeOption && control->cmdline->NextOptArgv(tmp)) {
                 localname = tmp;
                 if (FileDirExistCP(tmp.c_str()) == 2)
                     chdir(tmp.c_str());
