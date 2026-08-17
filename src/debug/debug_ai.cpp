@@ -2193,8 +2193,27 @@ void DEBUG_AI_Init(void) {
         return;
     }
 
+    /* POSIX-only: SO_REUSEADDR there just permits re-binding a port stuck
+     * in TIME_WAIT, so a second listener while the first is still bound
+     * and listening still correctly fails at bind() below. On Windows,
+     * SO_REUSEADDR has different (and dangerous) semantics: it lets a
+     * SECOND process successfully bind() and listen() on the SAME
+     * 127.0.0.1:9876 that a first, still-running DOSBox-X-AI instance
+     * already owns, with no error and no defined rule for which process
+     * subsequently receives an incoming connection -- exactly the "two
+     * Debugger GUIs open at once" scenario this bridge must fail loudly
+     * on rather than silently double-bind. This project's own vendored
+     * SDL_net (vs/sdlnet/SDLnetTCP.c, vs/sdl2net/SDLnetTCP.c) already
+     * documents and works around the identical Windows pitfall by simply
+     * not setting SO_REUSEADDR there; this mirrors that precedent instead
+     * of introducing a new one. Leaving it unset on Windows restores the
+     * platform's default exclusive-bind behavior, so a second instance's
+     * bind() below correctly fails and that instance's bridge stays
+     * disabled, per DEBUG_AI_Init()'s documented contract (debug_ai.h). */
+#if !defined(WIN32)
     int reuse = 1;
     setsockopt(g_listenSocket, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+#endif
 
     sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
