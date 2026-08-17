@@ -323,7 +323,22 @@ enum class AIMethod {
     ExecutionStepInto, ExecutionStepOver,
     /* Phase 7B: the "stopped" half of input.mouse.capture.get/.set's dual
      * route -- see "Mouse capture & absolute input (Phase 7B)" below. */
-    MouseCaptureGet, MouseCaptureSet
+    MouseCaptureGet, MouseCaptureSet,
+    /* Phase 7D: the "stopped" half of trace.execution.configure's dual
+     * route -- see "Execution trace (Phase 7D)" below. */
+    TraceConfigure
+};
+
+/* Phase 7D: trace.execution.configure's parsed params, shared between the
+ * stopped route (AIRequestItem) and running route (PendingInputRequest)
+ * below, and the emulator-thread-only g_traceConfig applied from either. */
+struct TraceConfigParams {
+    bool enabled = false;
+    uint32_t beforeInstructions = 0;
+    uint32_t afterInstructions = 0;
+    std::set<std::string> registers;  /* empty = all -- see BuildRegistersFragment() */
+    bool includeDisassembly = true;
+    uint32_t maxTraceBytes = 65536;
 };
 
 struct AIRequestItem {
@@ -339,6 +354,7 @@ struct AIRequestItem {
     uint32_t regValue = 0;            /* register.write */
     long long breakpointIndex = -1;   /* breakpoint.delete */
     bool mouseCaptureDesired = false; /* input.mouse.capture.set, stopped route */
+    TraceConfigParams traceConfig;    /* trace.execution.configure, stopped route */
 };
 
 static std::atomic<bool> g_bridgeRunning{false};
@@ -377,8 +393,21 @@ static std::deque<AIRequestItem> g_requestQueue;
 
 static std::atomic<bool> g_debuggerActive{false};
 
+/* Phase 7D: set whenever DEBUG_AI_SetDebuggerActive() observes a
+ * false->true transition -- i.e. exactly once per fresh stop, regardless
+ * of which entry point (breakpoint hit, Ctrl+Pause, -break-start, an AI
+ * pause_execution()) produced it, since ALL of them funnel through this
+ * one setter (see docs/phase7d-execution-trace-design.md). Consumed
+ * (checked-and-cleared) from DEBUG_AI_Poll() -- the same safe,
+ * already-proven context DEBUG_AI_DoStepInto() (Phase 4D) requires for
+ * the "after" half of a trace capture -- never acted on here directly. */
+static std::atomic<bool> g_tracePendingCapture{false};
+
 void DEBUG_AI_SetDebuggerActive(bool active) {
-    g_debuggerActive.store(active);
+    bool was = g_debuggerActive.exchange(active);
+    if (active && !was) {
+        g_tracePendingCapture.store(true, std::memory_order_release);
+    }
 }
 
 struct PendingPause {
@@ -629,7 +658,10 @@ enum class AIInputOp {
      * route, plus input.mouse.move_absolute/click_at (always running-only,
      * like every other guest-input op above) -- see "Mouse capture &
      * absolute input (Phase 7B)" below. */
-    MouseCaptureGet, MouseCaptureSet, MouseMoveAbsolute, MouseClickAt
+    MouseCaptureGet, MouseCaptureSet, MouseMoveAbsolute, MouseClickAt,
+    /* Phase 7D: the "running" half of trace.execution.configure's dual
+     * route -- see "Execution trace (Phase 7D)" below. */
+    TraceConfigure
 };
 
 struct PendingInputRequest {
@@ -646,6 +678,7 @@ struct PendingInputRequest {
     double y = 0.0;              /* move_absolute/click_at */
     bool normalized = false;     /* move_absolute/click_at: x/y space */
     bool clamp = false;          /* move_absolute/click_at */
+    TraceConfigParams traceConfig; /* trace.execution.configure, running route */
     bool captureDesired = false; /* MouseCaptureSet, running route */
 };
 
@@ -911,6 +944,14 @@ static bool ResolveAbsoluteTarget(double reqX, double reqY, bool normalized, boo
     return true;
 }
 
+/* Forward declaration -- defined below in the "Execution trace (Phase 7D)"
+ * section, but needed here (the running-route half of
+ * trace.execution.configure's dual route, in the switch just below) and
+ * that section is defined later in the file (it also needs
+ * DEBUG_AI_DoStepInto()/ExecuteRequest() context that comes after this
+ * point). Shared by both drain routes -- see that section for the design. */
+static std::string ApplyTraceConfigure(long long id, const TraceConfigParams &cfg);
+
 /* Drains every queued key/mouse input request and executes it against the
  * SAME KEYBOARD_AddKey()/Mouse_*() entry points real SDL input events use.
  * MUST be called only from the emulator thread, from the Normal_Loop()
@@ -1014,6 +1055,9 @@ void DEBUG_AI_CheckPendingInput(void) {
                 break;
             case AIInputOp::MouseCaptureSet:
                 dynResp = ApplyMouseCaptureSet(r.id, r.captureDesired);
+                break;
+            case AIInputOp::TraceConfigure:
+                dynResp = ApplyTraceConfigure(r.id, r.traceConfig);
                 break;
             case AIInputOp::MouseMoveAbsolute:
             case AIInputOp::MouseClickAt: {
@@ -1780,6 +1824,302 @@ static std::string ExecBreakpointList(long long id) {
     return result;
 }
 
+/* ------------------------------------------------------------------ */
+/* Execution trace (Phase 7D)                                          */
+/*                                                                      */
+/* trace.execution.configure/.list/.get -- see docs/                    */
+/* phase7d-execution-trace-design.md for the full design and source     */
+/* investigation this reuses (DOSBox-X's own existing heavy-debug        */
+/* instruction log for "before", the existing DEBUG_AI_DoStepInto()      */
+/* (Phase 4D) for "after", and CBreakpoint's existing match loop for      */
+/* trigger detection).                                                   */
+/* ------------------------------------------------------------------ */
+
+struct InstructionRecordSnapshot {
+    uint16_t cs = 0;
+    uint32_t ip = 0;
+    std::string bytesHex;
+    std::string disassembly;
+    uint16_t ax = 0, bx = 0, cx = 0, dx = 0, si = 0, di = 0, bp = 0, sp = 0, flags = 0;
+};
+
+/* TLogInst (debug.cpp) tracks only 7 individual status-flag booleans, not
+ * the raw FLAGS register -- direction/trap flags are not tracked at all.
+ * "before" entries' flags are reconstructed from those 7 bits (bit 1 is
+ * always set on real x86); "after" entries instead read the live
+ * reg_flags directly (see the after-stepping loop below), so only
+ * "before" entries are subject to this approximation -- documented in
+ * AGENT_GUIDE.md rather than silently inconsistent. */
+static uint16_t ReconstructFlagsFromHeavyLog(const DEBUG_AI_HeavyLogEntrySnapshot &e) {
+    uint16_t f = 0x0002;
+    if (e.cf) f |= 0x0001;
+    if (e.pf) f |= 0x0004;
+    if (e.af) f |= 0x0010;
+    if (e.zf) f |= 0x0040;
+    if (e.sf) f |= 0x0080;
+    if (e.iflag) f |= 0x0200;
+    if (e.of) f |= 0x0800;
+    return f;
+}
+
+static std::string TrimTrailingSpaces(const std::string &s) {
+    size_t end = s.find_last_not_of(' ');
+    return (end == std::string::npos) ? std::string() : s.substr(0, end + 1);
+}
+
+static std::string BuildInstructionRecordJson(int ordinal, const InstructionRecordSnapshot &rec,
+        const TraceConfigParams &cfg) {
+    std::string regs;
+    auto addReg = [&](const char *name, uint16_t value) {
+        if (!cfg.registers.empty() && cfg.registers.find(name) == cfg.registers.end()) return;
+        if (!regs.empty()) regs += ",";
+        regs += "\"" + std::string(name) + "\":" + std::to_string(value);
+    };
+    addReg("ax", rec.ax); addReg("bx", rec.bx); addReg("cx", rec.cx); addReg("dx", rec.dx);
+    addReg("si", rec.si); addReg("di", rec.di); addReg("bp", rec.bp); addReg("sp", rec.sp);
+    addReg("cs", rec.cs); addReg("ip", (uint16_t)rec.ip); addReg("flags", rec.flags);
+
+    char loc[16];
+    snprintf(loc, sizeof(loc), "%04X:%04X", (unsigned)rec.cs, (unsigned)(rec.ip & 0xFFFF));
+
+    return "{\"ordinal\":" + std::to_string(ordinal) +
+        ",\"location\":\"" + loc + "\","
+        "\"bytes_hex\":\"" + rec.bytesHex + "\","
+        "\"disassembly\":" + (cfg.includeDisassembly ? ("\"" + JsonEscape(rec.disassembly) + "\"") : "null") +
+        ",\"registers\":{" + regs + "}}";
+}
+
+struct TraceRecord {
+    uint64_t traceId = 0;
+    std::string triggerKind;   /* "code_breakpoint" | "memory_breakpoint" | "manual_pause" */
+    int32_t breakpointId = -1; /* -1 if triggerKind == "manual_pause" */
+    uint16_t triggerCs = 0;
+    uint32_t triggerIp = 0;
+    uint64_t triggerEmulatedMs = 0;
+    std::vector<InstructionRecordSnapshot> before; /* oldest first, last = trigger instruction */
+    std::vector<InstructionRecordSnapshot> after;  /* first-executed-after-trigger first */
+    bool completeAfter = true;
+    uint64_t droppedInstructionCount = 0;
+    TraceConfigParams configUsed; /* registers/include_disassembly at capture time */
+};
+
+static std::mutex g_traceMutex;
+static std::deque<TraceRecord> g_traces;
+static const size_t MAX_TRACES = 100; /* matches trace.execution.list's own limit:1..100 */
+static uint64_t g_droppedTraces = 0;
+static std::atomic<uint64_t> g_nextTraceId{1};
+
+/* Emulator-thread only -- both routes of trace.execution.configure funnel
+ * through the emulator thread (see ApplyTraceConfigure()), the same
+ * reasoning as g_lastGuestX/Y (Phase 7B) needing no lock. */
+static TraceConfigParams g_traceConfig;
+static uint32_t g_heavyLogCountAtEnable = 0;
+
+/* Shared by both drain routes (stopped/running) -- mirrors Phase 7B's
+ * BuildMouseCaptureStatusResult()/ApplyMouseCaptureSet() pattern. Turns
+ * DOSBox-X's existing heavy-debug instruction log on/off to match
+ * cfg.enabled -- see the design doc's "known limitation" on sharing that
+ * state with a human console user. */
+static std::string ApplyTraceConfigure(long long id, const TraceConfigParams &cfg) {
+    bool available = DEBUG_AI_SetHeavyTraceLogging(cfg.enabled);
+    if (cfg.enabled && !available) {
+        return "{\"id\":" + std::to_string(id) + ",\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\","
+            "\"message\":\"execution trace requires a heavy-debug build (C_HEAVY_DEBUG)\"}}";
+    }
+
+    g_traceConfig = cfg;
+    if (cfg.enabled) {
+        g_heavyLogCountAtEnable = DEBUG_AI_GetHeavyLogCount();
+    }
+
+    std::string regsArr = "[";
+    bool first = true;
+    for (const std::string &r : cfg.registers) {
+        if (!first) regsArr += ",";
+        regsArr += "\"" + r + "\"";
+        first = false;
+    }
+    regsArr += "]";
+
+    return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":{"
+        "\"enabled\":" + (cfg.enabled ? "true" : "false") + ","
+        "\"configuration\":{"
+        "\"before_instructions\":" + std::to_string(cfg.beforeInstructions) + ","
+        "\"after_instructions\":" + std::to_string(cfg.afterInstructions) + ","
+        "\"registers\":" + regsArr + ","
+        "\"include_disassembly\":" + (cfg.includeDisassembly ? "true" : "false") + ","
+        "\"max_trace_bytes\":" + std::to_string(cfg.maxTraceBytes) +
+        "}}}";
+}
+
+/* Rough per-instruction serialized-JSON cost, used only to decide how
+ * many "before" entries fit under max_trace_bytes -- see the design
+ * doc's "max_trace_bytes and truncation" section (drops from the FRONT
+ * of `before` first, i.e. the oldest/least-relevant-to-the-trigger
+ * entries, never truncating `after` ahead of `before`). */
+static size_t EstimateInstructionRecordBytes(const InstructionRecordSnapshot &rec) {
+    return 96 + rec.bytesHex.size() + rec.disassembly.size();
+}
+
+/* Drains a pending fresh-stop notification (see DEBUG_AI_SetDebuggerActive()
+ * above) and, if trace is currently enabled, captures one TraceRecord:
+ * "before" from the existing heavy-debug log, trigger info from
+ * CBreakpoint's last match, and "after" via repeated DEBUG_AI_DoStepInto()
+ * calls. MUST be called only from DEBUG_AI_Poll() -- the same context
+ * DEBUG_AI_DoStepInto() itself requires (Phase 4D) -- so this never runs
+ * inline from DEBUG_AI_SetDebuggerActive() itself. Cheap (one atomic
+ * exchange) whenever nothing is pending or trace is disabled. */
+static void DEBUG_AI_CheckPendingTraceCapture(void) {
+    if (!g_tracePendingCapture.exchange(false, std::memory_order_acquire)) return;
+    if (!g_traceConfig.enabled) return;
+
+    TraceRecord rec;
+    rec.traceId = g_nextTraceId.fetch_add(1);
+    rec.configUsed = g_traceConfig;
+
+    bool isMemory = false;
+    int32_t bpIndex = -1;
+    bool hadHit = DEBUG_AI_GetLastBreakpointHit(isMemory, bpIndex);
+    rec.triggerKind = hadHit ? (isMemory ? "memory_breakpoint" : "code_breakpoint") : "manual_pause";
+    rec.breakpointId = hadHit ? bpIndex : -1;
+    rec.triggerCs = SegValue(cs);
+    rec.triggerIp = reg_eip;
+    rec.triggerEmulatedMs = (uint64_t)PIC_FullIndex();
+
+    /* "before": most-recent-first from the heavy log, then reversed to
+     * chronological order (oldest first, last entry == the trigger
+     * instruction itself -- DEBUG_HeavyLogInstruction() already logs it
+     * before CheckBreakpoint() is evaluated on the same instruction). */
+    uint32_t capacity = DEBUG_AI_GetHeavyLogCapacity();
+    uint32_t availableBefore = 0;
+    if (capacity > 0) {
+        uint32_t logCountNow = DEBUG_AI_GetHeavyLogCount();
+        uint32_t sinceEnable = (uint32_t)(((uint64_t)logCountNow + capacity - g_heavyLogCountAtEnable) % capacity);
+        /* sinceEnable==0 here means either nothing logged (shouldn't
+         * happen -- the trigger itself was just logged) or exactly
+         * `capacity` instructions ran since enable, i.e. a full wrap --
+         * treat as "the whole buffer is fresh" either way. */
+        availableBefore = (sinceEnable == 0) ? capacity : std::min<uint32_t>(sinceEnable, capacity);
+    }
+    uint32_t wantBefore = std::min<uint32_t>(g_traceConfig.beforeInstructions, availableBefore);
+
+    std::vector<InstructionRecordSnapshot> beforeMostRecentFirst;
+    for (uint32_t k = 0; k < wantBefore; k++) {
+        DEBUG_AI_HeavyLogEntrySnapshot e;
+        if (!DEBUG_AI_GetHeavyLogEntry(k, e)) break;
+
+        InstructionRecordSnapshot snap;
+        snap.cs = e.cs;
+        snap.ip = e.eip;
+        snap.disassembly = TrimTrailingSpaces(std::string(e.dline));
+        /* bytes_hex is re-read from CURRENT guest memory at this
+         * historical CS:IP, not preserved from execution time -- see the
+         * design doc: self-modifying code between this instruction
+         * running and trace capture could make it stale, unlike
+         * disassembly (preserved verbatim from execution time). */
+        uint32_t physAddr = (uint32_t)GetAddress(e.cs, e.eip);
+        char freshDline[256]; freshDline[0] = 0;
+        Bitu size = DasmI386(freshDline, (PhysPt)physAddr, e.eip, cpu.code.big);
+        if (size == 0) size = 1;
+        snap.bytesHex = ReadInstructionBytesHex(physAddr, size);
+        snap.ax = (uint16_t)e.eax; snap.bx = (uint16_t)e.ebx; snap.cx = (uint16_t)e.ecx; snap.dx = (uint16_t)e.edx;
+        snap.si = (uint16_t)e.esi; snap.di = (uint16_t)e.edi; snap.bp = (uint16_t)e.ebp; snap.sp = (uint16_t)e.esp;
+        snap.flags = ReconstructFlagsFromHeavyLog(e);
+        beforeMostRecentFirst.push_back(snap);
+    }
+    rec.before.assign(beforeMostRecentFirst.rbegin(), beforeMostRecentFirst.rend());
+
+    /* "after": each DEBUG_AI_DoStepInto() call executes the instruction
+     * at the current position and lands at the next one -- so the FIRST
+     * call executes the trigger instruction itself (already the last
+     * `before` entry) and lands at the first genuinely "after" position,
+     * which is what gets captured as after[0]. See the design doc's
+     * "after: the EXISTING, already-verified DEBUG_AI_DoStepInto()"
+     * section for why this runs here (DEBUG_AI_Poll()) and not inline
+     * from the stop-transition notification itself. */
+    for (uint32_t k = 0; k < g_traceConfig.afterInstructions; k++) {
+        DEBUG_AI_DoStepInto();
+
+        bool isMemory2 = false;
+        int32_t bpIndex2 = -1;
+        if (DEBUG_AI_GetLastBreakpointHit(isMemory2, bpIndex2)) {
+            /* Stepped into another breakpoint mid-sequence -- stop here,
+             * the partial `after` collected so far is still valid. */
+            rec.completeAfter = false;
+            break;
+        }
+
+        InstructionRecordSnapshot snap;
+        uint16_t curCS = SegValue(cs);
+        uint32_t curEIP = reg_eip;
+        uint32_t physAddr = (uint32_t)GetAddress(curCS, curEIP);
+        char dline[256]; dline[0] = 0;
+        Bitu size = DasmI386(dline, (PhysPt)physAddr, curEIP, cpu.code.big);
+        if (size == 0) size = 1;
+        snap.cs = curCS;
+        snap.ip = curEIP;
+        snap.disassembly = dline;
+        snap.bytesHex = ReadInstructionBytesHex(physAddr, size);
+        snap.ax = (uint16_t)reg_eax; snap.bx = (uint16_t)reg_ebx; snap.cx = (uint16_t)reg_ecx; snap.dx = (uint16_t)reg_edx;
+        snap.si = (uint16_t)reg_esi; snap.di = (uint16_t)reg_edi; snap.bp = (uint16_t)reg_ebp; snap.sp = (uint16_t)reg_esp;
+        snap.flags = (uint16_t)reg_flags;
+        rec.after.push_back(snap);
+    }
+
+    /* max_trace_bytes: drop from the FRONT of `before` (oldest) until the
+     * estimated total fits -- see EstimateInstructionRecordBytes(). */
+    size_t total = 0;
+    for (const auto &s : rec.before) total += EstimateInstructionRecordBytes(s);
+    for (const auto &s : rec.after) total += EstimateInstructionRecordBytes(s);
+    while (total > g_traceConfig.maxTraceBytes && !rec.before.empty()) {
+        total -= EstimateInstructionRecordBytes(rec.before.front());
+        rec.before.erase(rec.before.begin());
+        rec.droppedInstructionCount++;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_traceMutex);
+        while (g_traces.size() >= MAX_TRACES) {
+            g_traces.pop_front();
+            g_droppedTraces++;
+        }
+        g_traces.push_back(std::move(rec));
+    }
+}
+
+static std::string BuildTraceGetJson(long long id, const TraceRecord &rec) {
+    char loc[16];
+    snprintf(loc, sizeof(loc), "%04X:%04X", (unsigned)rec.triggerCs, (unsigned)(rec.triggerIp & 0xFFFF));
+
+    std::string beforeArr = "[";
+    for (size_t i = 0; i < rec.before.size(); i++) {
+        if (i) beforeArr += ",";
+        beforeArr += BuildInstructionRecordJson((int)i, rec.before[i], rec.configUsed);
+    }
+    beforeArr += "]";
+
+    std::string afterArr = "[";
+    for (size_t i = 0; i < rec.after.size(); i++) {
+        if (i) afterArr += ",";
+        afterArr += BuildInstructionRecordJson((int)i, rec.after[i], rec.configUsed);
+    }
+    afterArr += "]";
+
+    return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":{"
+        "\"trace_id\":" + std::to_string(rec.traceId) + ","
+        "\"trigger\":{"
+        "\"kind\":\"" + rec.triggerKind + "\","
+        "\"breakpoint_id\":" + (rec.breakpointId >= 0 ? std::to_string(rec.breakpointId) : "null") + ","
+        "\"location\":\"" + loc + "\","
+        "\"emulated_ms\":" + std::to_string(rec.triggerEmulatedMs) +
+        "},"
+        "\"before\":" + beforeArr + ","
+        "\"after\":" + afterArr + ","
+        "\"complete_after\":" + (rec.completeAfter ? "true" : "false") + ","
+        "\"dropped_instruction_count\":" + std::to_string(rec.droppedInstructionCount) +
+        "}}";
+}
+
 static std::string ExecuteRequest(const AIRequestItem &item) {
     switch (item.method) {
         case AIMethod::DebugStatus:      return ExecDebugStatus(item.id);
@@ -1799,6 +2139,7 @@ static std::string ExecuteRequest(const AIRequestItem &item) {
         case AIMethod::ExecutionStepOver: return ExecExecutionStepOver(item);
         case AIMethod::MouseCaptureGet:   return ExecMouseCaptureGet(item.id);
         case AIMethod::MouseCaptureSet:   return ExecMouseCaptureSet(item.id, item.mouseCaptureDesired);
+        case AIMethod::TraceConfigure:    return ApplyTraceConfigure(item.id, item.traceConfig);
     }
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"unhandled method\"}}", item.id);
@@ -1806,6 +2147,15 @@ static std::string ExecuteRequest(const AIRequestItem &item) {
 }
 
 void DEBUG_AI_Poll(void) {
+    /* Phase 7D: consumes a pending "debugger just genuinely stopped"
+     * notification (see DEBUG_AI_SetDebuggerActive() above) and, if trace
+     * is enabled, captures one TraceRecord -- including, if
+     * after_instructions>0, single-stepping via the SAME
+     * DEBUG_AI_DoStepInto() context this function's ExecuteRequest() calls
+     * below already require. A no-op (one atomic exchange) the vast
+     * majority of iterations. */
+    DEBUG_AI_CheckPendingTraceCapture();
+
     for (;;) {
         AIRequestItem item;
         {
@@ -2449,6 +2799,173 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
             "\"device\":\"" + receipt.device + "\","
             "\"guest_observation\":{\"kind\":null,\"observed_at_emulated_ms\":null}"
             "}}";
+        SendLine(conn, resp);
+        return;
+    } else if (method == "trace.execution.configure") {
+        /* Phase 7D: dual route like input.mouse.capture.get/.set (Phase
+         * 7B) -- this touches DOSBox-X's own heavy-debug logHeavy flag
+         * (emulator-thread-owned data), so it must run on that thread
+         * either way, but is meaningful whether stopped or running. */
+        if (!params) { RespondError("INVALID_PARAMETER", "trace.execution.configure requires \"params\""); return; }
+
+        TraceConfigParams cfg;
+        auto itEnabled = params->object.find("enabled");
+        if (itEnabled == params->object.end() || itEnabled->second.type != JsonValue::Type::Bool) {
+            RespondError("INVALID_PARAMETER", "params.enabled must be a boolean"); return;
+        }
+        cfg.enabled = itEnabled->second.number != 0;
+
+        auto itBefore = params->object.find("before_instructions");
+        if (itBefore != params->object.end()) {
+            if (itBefore->second.type != JsonValue::Type::Number) { RespondError("INVALID_PARAMETER", "params.before_instructions must be a number"); return; }
+            long long v = (long long)itBefore->second.number;
+            if (v < 0 || v > 4096) { RespondError("INVALID_PARAMETER", "params.before_instructions must be 0..4096"); return; }
+            cfg.beforeInstructions = (uint32_t)v;
+        }
+        auto itAfter = params->object.find("after_instructions");
+        if (itAfter != params->object.end()) {
+            if (itAfter->second.type != JsonValue::Type::Number) { RespondError("INVALID_PARAMETER", "params.after_instructions must be a number"); return; }
+            long long v = (long long)itAfter->second.number;
+            if (v < 0 || v > 4096) { RespondError("INVALID_PARAMETER", "params.after_instructions must be 0..4096"); return; }
+            cfg.afterInstructions = (uint32_t)v;
+        }
+        auto itRegs = params->object.find("registers");
+        if (itRegs != params->object.end()) {
+            if (itRegs->second.type != JsonValue::Type::Array) { RespondError("INVALID_PARAMETER", "params.registers must be an array of strings"); return; }
+            static const std::set<std::string> validRegs = {"ax","bx","cx","dx","si","di","bp","sp","cs","ip","flags"};
+            for (const JsonValue &v : itRegs->second.array) {
+                if (v.type != JsonValue::Type::String || validRegs.find(v.str) == validRegs.end()) {
+                    RespondError("INVALID_PARAMETER", "params.registers entries must be one of ax/bx/cx/dx/si/di/bp/sp/cs/ip/flags");
+                    return;
+                }
+                cfg.registers.insert(v.str);
+            }
+        }
+        auto itDisasm = params->object.find("include_disassembly");
+        if (itDisasm != params->object.end()) {
+            if (itDisasm->second.type != JsonValue::Type::Bool) { RespondError("INVALID_PARAMETER", "params.include_disassembly must be a boolean"); return; }
+            cfg.includeDisassembly = itDisasm->second.number != 0;
+        }
+        auto itMaxBytes = params->object.find("max_trace_bytes");
+        if (itMaxBytes != params->object.end()) {
+            if (itMaxBytes->second.type != JsonValue::Type::Number) { RespondError("INVALID_PARAMETER", "params.max_trace_bytes must be a number"); return; }
+            long long v = (long long)itMaxBytes->second.number;
+            if (v < 65536 || v > 4194304) { RespondError("INVALID_PARAMETER", "params.max_trace_bytes must be 65536..4194304"); return; }
+            cfg.maxTraceBytes = (uint32_t)v;
+        }
+
+        if (g_debuggerActive.load()) {
+            /* Stopped: fall through to the common g_requestQueue push
+             * below -- same route debug.status/cpu.get/etc. already use. */
+            item.method = AIMethod::TraceConfigure;
+            item.traceConfig = cfg;
+        } else {
+            /* Running: route through g_pendingInputs/DEBUG_AI_CheckPendingInput(),
+             * the SAME mechanism input.mouse.move_relative etc. use. */
+            PendingInputRequest req;
+            req.op = AIInputOp::TraceConfigure;
+            req.conn = conn;
+            req.id = id;
+            req.traceConfig = cfg;
+
+            LOG(LOG_MISC, LOG_DEBUG)("AI bridge: request id=%lld method=%s", id, method.c_str());
+            {
+                std::lock_guard<std::mutex> lk(conn->mtx);
+                conn->responseReady = false;
+            }
+            DEBUG_AI_RequestInput(req);
+
+            std::unique_lock<std::mutex> lk(conn->mtx);
+            conn->cv.wait_for(lk, std::chrono::seconds(REQUEST_TIMEOUT_SECONDS),
+                               [&] { return conn->responseReady || conn->stopping.load(); });
+            if (conn->responseReady) {
+                std::string resp = conn->responseLine;
+                lk.unlock();
+                SendLine(conn, resp);
+            } else {
+                lk.unlock();
+                DEBUG_AI_CancelInput(conn, id);
+                if (!conn->stopping.load())
+                    RespondError("EXECUTION_TIMEOUT", method + " did not complete within the timeout");
+            }
+            return;
+        }
+    } else if (method == "trace.execution.list") {
+        /* Answered directly, like input.receipt.get -- g_traces is
+         * already-computed history behind a mutex, no emulator-thread
+         * execution needed. Meaningful whether stopped or running. */
+        long long limit = 100;
+        uint64_t afterTraceId = 0;
+        bool hasAfter = false;
+        if (params) {
+            auto itLimit = params->object.find("limit");
+            if (itLimit != params->object.end()) {
+                if (itLimit->second.type != JsonValue::Type::Number) { RespondError("INVALID_PARAMETER", "params.limit must be a number"); return; }
+                limit = (long long)itLimit->second.number;
+                if (limit < 1 || limit > 100) { RespondError("INVALID_PARAMETER", "params.limit must be 1..100"); return; }
+            }
+            auto itAfterId = params->object.find("after_trace_id");
+            if (itAfterId != params->object.end() && itAfterId->second.type == JsonValue::Type::Number) {
+                afterTraceId = (uint64_t)itAfterId->second.number;
+                hasAfter = true;
+            }
+        }
+
+        std::string arr = "[";
+        uint64_t droppedSnapshot;
+        {
+            std::lock_guard<std::mutex> lk(g_traceMutex);
+            droppedSnapshot = g_droppedTraces;
+            bool first = true;
+            long long emitted = 0;
+            for (const TraceRecord &rec : g_traces) {
+                if (emitted >= limit) break;
+                if (hasAfter && rec.traceId <= afterTraceId) continue;
+                if (!first) arr += ",";
+                first = false;
+                char loc[16];
+                snprintf(loc, sizeof(loc), "%04X:%04X", (unsigned)rec.triggerCs, (unsigned)(rec.triggerIp & 0xFFFF));
+                arr += "{\"trace_id\":" + std::to_string(rec.traceId) + ","
+                    "\"trigger\":{\"kind\":\"" + rec.triggerKind + "\","
+                    "\"breakpoint_id\":" + (rec.breakpointId >= 0 ? std::to_string(rec.breakpointId) : "null") + ","
+                    "\"location\":\"" + loc + "\","
+                    "\"emulated_ms\":" + std::to_string(rec.triggerEmulatedMs) + "},"
+                    "\"before_count\":" + std::to_string(rec.before.size()) + ","
+                    "\"after_count\":" + std::to_string(rec.after.size()) + ","
+                    "\"complete_after\":" + (rec.completeAfter ? "true" : "false") + "}";
+                emitted++;
+            }
+        }
+        arr += "]";
+
+        std::string resp = "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":{"
+            "\"traces\":" + arr + ",\"dropped_traces\":" + std::to_string(droppedSnapshot) + "}}";
+        SendLine(conn, resp);
+        return;
+    } else if (method == "trace.execution.get") {
+        if (!params) { RespondError("INVALID_PARAMETER", "trace.execution.get requires \"params\""); return; }
+        auto itTraceId = params->object.find("trace_id");
+        if (itTraceId == params->object.end() || itTraceId->second.type != JsonValue::Type::Number) {
+            RespondError("INVALID_PARAMETER", "params.trace_id must be a number"); return;
+        }
+        uint64_t traceId = (uint64_t)itTraceId->second.number;
+
+        std::string resp;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(g_traceMutex);
+            for (const TraceRecord &rec : g_traces) {
+                if (rec.traceId == traceId) {
+                    resp = BuildTraceGetJson(id, rec);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            RespondError("TRACE_NOT_FOUND", "no trace found for that trace_id (evicted, or never issued)");
+            return;
+        }
         SendLine(conn, resp);
         return;
     } else if (method == "video.frame.capture") {

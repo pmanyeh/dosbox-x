@@ -612,6 +612,25 @@ public:
 	static uint16_t			GetCount			(void)						{ return (uint16_t)BPoints.size(); };
 	static CBreakpoint*		GetByIndex			(uint16_t index);
 
+	// Phase 7D (DOSBox-X-AI project, src/debug/debug_ai.cpp): get-and-clear
+	// accessor for whichever breakpoint CheckBreakpoint() most recently
+	// matched -- lets the AI bridge's execution-trace feature identify what
+	// triggered a stop without re-evaluating CheckBreakpoint() a second
+	// time (which would incorrectly re-process "once" breakpoint deletion
+	// and memory-watchpoint value updates). Deliberately returns a resolved
+	// snapshot (kind + BPoints position AT MATCH TIME), never a
+	// CBreakpoint* -- a "once" code breakpoint is deleted in the very same
+	// CheckBreakpoint() call that matches it, so a raw pointer would risk
+	// dangling by the time a caller (running later, from DEBUG_AI_Poll())
+	// reads it. Single-consumer: clears on read so a stale hit from an
+	// earlier stop can never be misattributed to a later one.
+	static bool				GetAndClearLastHit	(bool &isMemory, int32_t &breakpointIndex) {
+		if (!g_lastHitValid) return false;
+		isMemory = g_lastHitIsMemory;
+		breakpointIndex = g_lastHitIndex;
+		g_lastHitValid = false;
+		return true;
+	};
 
 private:
 	EBreakpoint	type;
@@ -631,6 +650,20 @@ private:
 	bool		once;
 
 	static std::list<CBreakpoint*>	BPoints;
+	// Phase 7D: see GetAndClearLastHit() above.
+	static bool				g_lastHitValid;
+	static bool				g_lastHitIsMemory;
+	static int32_t			g_lastHitIndex;
+	// Records the current BPoints position of `bp` into the above three
+	// fields -- called from CheckBreakpoint() BEFORE any deletion below it
+	// could invalidate `bp`. Private: only CheckBreakpoint() itself needs
+	// this (it already has `bp`/its position in scope at each call site).
+	static void				RecordLastHit		(CBreakpoint *bp, bool isMemory) {
+		int32_t idx = 0;
+		for (auto j = BPoints.begin(); j != BPoints.end(); ++j, ++idx) {
+			if (*j == bp) { g_lastHitValid = true; g_lastHitIsMemory = isMemory; g_lastHitIndex = idx; return; }
+		}
+	};
 #if C_HEAVY_DEBUG
 	friend bool DEBUG_HeavyIsBreakpoint(void);
 #endif
@@ -684,6 +717,9 @@ void CBreakpoint::Activate(bool _active)
 
 // Statics
 std::list<CBreakpoint*> CBreakpoint::BPoints;
+bool CBreakpoint::g_lastHitValid = false;
+bool CBreakpoint::g_lastHitIsMemory = false;
+int32_t CBreakpoint::g_lastHitIndex = -1;
 
 CBreakpoint* CBreakpoint::AddBreakpoint(uint16_t seg, uint32_t off, bool once)
 {
@@ -755,6 +791,9 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 		if ((bp->GetType() == BKPNT_PHYSICAL) && bp->IsActive() &&
 		    (bp->GetLocation() == GetAddress(seg, off))) {
 			// Found
+			// Phase 7D: capture the match BEFORE the "once" deletion just
+			// below can invalidate `bp` -- see RecordLastHit()'s comment.
+			RecordLastHit(bp, false);
 			if (bp->GetOnce()) {
 				// delete it, if it should only be used once
 				(BPoints.erase)(i);
@@ -798,6 +837,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
                     }
 					DEBUG_ShowMsg("DEBUG: Memory breakpoint %s: %04X:%04X - %02X -> %02X\n",(bp->GetType()==BKPNT_MEMORY_PROT)?"(Prot)":"",bp->GetSegment(),bp->GetOffset(),bp->GetValue(),value);
 					bp->SetValue(value);
+					RecordLastHit(bp, true); // Phase 7D
 					return true;
 				}
 			}
@@ -1037,6 +1077,14 @@ int DEBUG_AI_RealMemoryBreakpointAdd(uint16_t seg, uint32_t off) {
 
 bool DEBUG_AI_BreakpointDelete(uint16_t index) {
 	return CBreakpoint::DeleteByIndex(index);
+}
+
+/* Phase 7D: thin wrapper -- CBreakpoint itself is private to this file
+ * (declared here, not in a header), so debug_ai.cpp cannot call
+ * CBreakpoint::GetAndClearLastHit() directly. See that method's comment
+ * above for why this returns a resolved snapshot, never a CBreakpoint*. */
+bool DEBUG_AI_GetLastBreakpointHit(bool &isMemory, int32_t &breakpointIndex) {
+	return CBreakpoint::GetAndClearLastHit(isMemory, breakpointIndex);
 }
 
 bool DEBUG_Breakpoint(void)
@@ -6524,6 +6572,64 @@ void DEBUG_StopLog(void) {
 }
 
 #endif // HEAVY DEBUG
+
+/* Phase 7D (DOSBox-X-AI project, src/debug/debug_ai.cpp): thin accessors
+ * exposing the existing logHeavy/logInst[] ring buffer (above,
+ * C_HEAVY_DEBUG-only) to the AI bridge's execution-trace feature, without
+ * exposing the file-local TLogInst type itself -- see docs/
+ * phase7d-execution-trace-design.md. Declared unconditionally (mirroring
+ * DEBUG_AI_RealMemoryBreakpointAdd()'s existing precedent above) so
+ * debug_ai.cpp needs no C_HEAVY_DEBUG conditionals of its own; on a
+ * non-heavy-debug build there is no ring buffer to expose, so these
+ * report "unavailable" rather than pretending to have data. */
+bool DEBUG_AI_SetHeavyTraceLogging(bool enable) {
+#if C_HEAVY_DEBUG
+	logHeavy = enable;
+	return true;
+#else
+	(void)enable;
+	return false;
+#endif
+}
+
+uint32_t DEBUG_AI_GetHeavyLogCount(void) {
+#if C_HEAVY_DEBUG
+	return logCount;
+#else
+	return 0;
+#endif
+}
+
+uint32_t DEBUG_AI_GetHeavyLogCapacity(void) {
+#if C_HEAVY_DEBUG
+	return LOGCPUMAX;
+#else
+	return 0;
+#endif
+}
+
+bool DEBUG_AI_GetHeavyLogEntry(uint32_t indexFromMostRecent, DEBUG_AI_HeavyLogEntrySnapshot &out) {
+#if C_HEAVY_DEBUG
+	if (indexFromMostRecent >= LOGCPUMAX) return false;
+	/* logCount is the NEXT write position -- the most recent entry is at
+	 * logCount-1 (wrapping). indexFromMostRecent=0 is that entry. */
+	uint32_t idx = (logCount + LOGCPUMAX - 1 - indexFromMostRecent) % LOGCPUMAX;
+	const TLogInst &inst = logInst[idx];
+	out.cs = inst.s_cs;
+	out.eip = inst.eip;
+	out.eax = inst.eax; out.ebx = inst.ebx; out.ecx = inst.ecx; out.edx = inst.edx;
+	out.esi = inst.esi; out.edi = inst.edi; out.ebp = inst.ebp; out.esp = inst.esp;
+	out.ds = inst.s_ds; out.es = inst.s_es; out.fs = inst.s_fs; out.gs = inst.s_gs; out.ss = inst.s_ss;
+	out.cf = inst.c; out.zf = inst.z; out.sf = inst.s; out.of = inst.o; out.af = inst.a; out.pf = inst.p; out.iflag = inst.i;
+	strncpy(out.dline, inst.dline, sizeof(out.dline) - 1);
+	out.dline[sizeof(out.dline) - 1] = '\0';
+	return true;
+#else
+	(void)indexFromMostRecent;
+	(void)out;
+	return false;
+#endif
+}
 
 
 #endif // DEBUG

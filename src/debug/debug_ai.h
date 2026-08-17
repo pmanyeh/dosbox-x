@@ -269,6 +269,77 @@ void DEBUG_AI_CheckPendingInput(void);
 void DEBUG_AI_CheckPendingFrameCapture(Bitu width, Bitu height, Bitu bpp, Bitu pitch,
     Bitu flags, const uint8_t *data, const uint8_t *pal);
 
+/* ------------------------------------------------------------------ */
+/* Execution trace (Phase 7D)                                          */
+/*                                                                      */
+/* trace.execution.configure/.list/.get let an agent see the            */
+/* instructions immediately before and after a code/memory breakpoint   */
+/* fires. Reuses three EXISTING mechanisms rather than inventing new     */
+/* ones -- see docs/phase7d-execution-trace-design.md for the full       */
+/* design and source investigation:                                     */
+/*                                                                       */
+/*  - "before": DOSBox-X's own existing heavy-debug instruction log      */
+/*    (logHeavy/logInst[]/logCount, src/debug/debug.cpp, C_HEAVY_DEBUG   */
+/*    only -- the SAME ring buffer its "LOG HEAVY" debugger-console       */
+/*    command already writes into). DEBUG_AI_SetHeavyTraceLogging()/      */
+/*    DEBUG_AI_GetHeavyLogCount()/DEBUG_AI_GetHeavyLogEntry() below are   */
+/*    thin accessors onto it, declared unconditionally (mirroring         */
+/*    DEBUG_AI_RealMemoryBreakpointAdd()'s existing precedent above) --   */
+/*    they report "unavailable" on a non-heavy-debug build rather than    */
+/*    requiring debug_ai.cpp to know about C_HEAVY_DEBUG itself.          */
+/*  - "after": the EXISTING, already-verified DEBUG_AI_DoStepInto()       */
+/*    (Phase 4D) called repeatedly, from the SAME DEBUG_AI_Poll()          */
+/*    context it already requires -- no new single-step mechanism.        */
+/*  - trigger detection: CBreakpoint::GetAndClearLastHit() (debug.cpp,     */
+/*    new for Phase 7D) -- a minimal, additive side effect of              */
+/*    CheckBreakpoint()'s two existing `return true;` sites, not a         */
+/*    second/parallel breakpoint-matching decision.                        */
+/* ------------------------------------------------------------------ */
+
+/* One instruction's worth of the heavy-debug log (see above) --
+ * mirrors one TLogInst entry's fields (debug.cpp, private to that file)
+ * without exposing that type here. dline is DasmI386()'s pre-formatted,
+ * space-padded 30-column disassembly text (trailing spaces, not yet
+ * trimmed -- debug_ai.cpp trims when building its JSON). */
+struct DEBUG_AI_HeavyLogEntrySnapshot {
+    uint16_t cs;
+    uint32_t eip;
+    uint32_t eax, ebx, ecx, edx, esi, edi, ebp, esp;
+    uint16_t ds, es, fs, gs, ss;
+    bool cf, zf, sf, of, af, pf, iflag;
+    char dline[31];
+};
+
+/* Implemented in debug.cpp. Turns DOSBox-X's own existing heavy-debug
+ * instruction log on/off -- the SAME state its "LOG HEAVY" debugger
+ * console command uses (see docs/phase7d-execution-trace-design.md's
+ * "known limitation" on sharing this state with a human console user).
+ * Returns false on a non-heavy-debug build (nothing to turn on). */
+bool DEBUG_AI_SetHeavyTraceLogging(bool enable);
+
+/* Implemented in debug.cpp. The heavy-debug log's current write
+ * position (wraps at LOGCPUMAX=20000) -- snapshot this when trace is
+ * enabled to know how many genuinely fresh entries exist later, without
+ * a new per-instruction counter. Returns 0 on a non-heavy-debug build. */
+uint32_t DEBUG_AI_GetHeavyLogCount(void);
+
+/* Implemented in debug.cpp. The heavy-debug log's fixed capacity
+ * (LOGCPUMAX=20000, comfortably above the 4096 max before_instructions
+ * this bridge allows). Returns 0 on a non-heavy-debug build. */
+uint32_t DEBUG_AI_GetHeavyLogCapacity(void);
+
+/* Implemented in debug.cpp. indexFromMostRecent=0 is the most recently
+ * logged instruction, 1 the one before that, etc. Returns false (out
+ * left untouched) if indexFromMostRecent is out of range or heavy-debug
+ * logging is unavailable on this build. */
+bool DEBUG_AI_GetHeavyLogEntry(uint32_t indexFromMostRecent, DEBUG_AI_HeavyLogEntrySnapshot &out);
+
+/* Implemented in debug.cpp -- thin wrapper around
+ * CBreakpoint::GetAndClearLastHit() (private to that file). Get-and-clear:
+ * returns false if CheckBreakpoint() has not matched anything since the
+ * last call (e.g. a manual pause with no breakpoint involved). */
+bool DEBUG_AI_GetLastBreakpointHit(bool &isMemory, int32_t &breakpointIndex);
+
 #endif
 
 #endif
