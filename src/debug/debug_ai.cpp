@@ -764,6 +764,81 @@ static bool     g_hasLastGuestXY = false;
 static long long g_lastGuestX = 0;
 static long long g_lastGuestY = 0;
 
+/* ------------------------------------------------------------------ */
+/* Input dispatch receipts (Phase 7C)                                  */
+/*                                                                      */
+/* Unlike capture.get/.set above, a receipt describes something that     */
+/* ALREADY happened (a completed KEYBOARD_AddKey()/Mouse_*() dispatch),  */
+/* so answering input.receipt.get needs no emulator-thread execution --  */
+/* just safe concurrent access to already-computed history. Written      */
+/* ONLY from DEBUG_AI_CheckPendingInput() (the emulator thread -- every  */
+/* dispatching op, Phase 6B's and 7B's alike, goes through that one       */
+/* function); read directly from whichever socket thread receives an     */
+/* input.receipt.get, under the same mutex, with no queue involved at    */
+/* all. See docs/phase7c-input-dispatch-receipts-design.md.              */
+/* ------------------------------------------------------------------ */
+
+struct InputReceipt {
+    uint64_t sequence = 0;
+    std::string device;                 /* "keyboard" | "mouse" */
+    uint64_t dispatchedAtEmulatedMs = 0; /* PIC_FullIndex() at dispatch time */
+    std::chrono::steady_clock::time_point recordedAt;
+};
+
+static std::mutex g_receiptMutex;
+static std::deque<InputReceipt> g_receipts;
+static const size_t MAX_RECEIPTS = 4096;
+static const std::chrono::minutes RECEIPT_MAX_AGE{10};
+
+/* Called ONLY from DEBUG_AI_CheckPendingInput(), immediately after a
+ * dispatch actually happens -- never speculatively, never for a request
+ * that failed validation (ABSOLUTE_MOUSE_UNAVAILABLE/INVALID_PARAMETER
+ * cases below never reach this). Evicts by EITHER bound independently
+ * (whichever an entry hits first), per the requirements draft section
+ * 5.2. */
+static void RecordInputReceipt(uint64_t seq, const char *device, uint64_t dispatchedAtMs) {
+    std::lock_guard<std::mutex> lk(g_receiptMutex);
+    auto now = std::chrono::steady_clock::now();
+    while (!g_receipts.empty() && (now - g_receipts.front().recordedAt) > RECEIPT_MAX_AGE)
+        g_receipts.pop_front();
+    while (g_receipts.size() >= MAX_RECEIPTS)
+        g_receipts.pop_front();
+
+    InputReceipt r;
+    r.sequence = seq;
+    r.device = device;
+    r.dispatchedAtEmulatedMs = dispatchedAtMs;
+    r.recordedAt = now;
+    g_receipts.push_back(std::move(r));
+}
+
+/* Called from a socket thread (HandleLine()). A stale (evicted)
+ * input_sequence and one that was never issued are deliberately
+ * indistinguishable -- this bridge does not separately track "highest
+ * sequence ever issued" -- both simply report as not found
+ * (INPUT_RECEIPT_EXPIRED). */
+static bool LookupInputReceipt(uint64_t seq, InputReceipt &out) {
+    std::lock_guard<std::mutex> lk(g_receiptMutex);
+    for (const auto &r : g_receipts) {
+        if (r.sequence == seq) { out = r; return true; }
+    }
+    return false;
+}
+
+/* Shared by every dispatching case in DEBUG_AI_CheckPendingInput()'s
+ * switch below -- the five receipt fields (requirements draft section
+ * 5.1), as a JSON fragment (no surrounding braces) to splice into each
+ * op's existing result object. guest_observed is always
+ * "not_supported" in this implementation -- see the design doc's
+ * "Goal" section for why real guest-side observation is out of scope
+ * for now, not merely unfinished. */
+static std::string ReceiptFieldsJson(uint64_t seq, uint64_t dispatchedAtMs) {
+    return "\"queued\":true,\"dispatched\":true,"
+        "\"dispatched_at_emulated_ms\":" + std::to_string(dispatchedAtMs) + ","
+        "\"input_sequence\":" + std::to_string(seq) + ","
+        "\"guest_observed\":\"not_supported\"";
+}
+
 /* render.src.width/height doubled by dblw/dblh -- the SAME formula
  * UnpackFrameToRGBA8888() (Phase 7A, above) applies, so this always
  * agrees with video.frame.capture's own reported width/height for the
@@ -861,26 +936,46 @@ void DEBUG_AI_CheckPendingInput(void) {
         std::string dynResp;
 
         switch (r.op) {
-            case AIInputOp::KeyDown:
+            case AIInputOp::KeyDown: {
                 KEYBOARD_AddKey(r.key, true);
                 g_heldKeys[r.conn].insert(r.key);
-                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"pressed\":true}}", r.id);
+                uint64_t seq = g_nextInputSequence.fetch_add(1);
+                uint64_t ms = (uint64_t)PIC_FullIndex();
+                RecordInputReceipt(seq, "keyboard", ms);
+                dynResp = "{\"id\":" + std::to_string(r.id) + ",\"ok\":true,\"result\":{\"pressed\":true," +
+                    ReceiptFieldsJson(seq, ms) + "}}";
                 break;
-            case AIInputOp::KeyUp:
+            }
+            case AIInputOp::KeyUp: {
                 KEYBOARD_AddKey(r.key, false);
                 g_heldKeys[r.conn].erase(r.key);
-                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"pressed\":false}}", r.id);
+                uint64_t seq = g_nextInputSequence.fetch_add(1);
+                uint64_t ms = (uint64_t)PIC_FullIndex();
+                RecordInputReceipt(seq, "keyboard", ms);
+                dynResp = "{\"id\":" + std::to_string(r.id) + ",\"ok\":true,\"result\":{\"pressed\":false," +
+                    ReceiptFieldsJson(seq, ms) + "}}";
                 break;
-            case AIInputOp::KeyTap:
+            }
+            case AIInputOp::KeyTap: {
                 KEYBOARD_AddKey(r.key, true);
                 KEYBOARD_AddKey(r.key, false);
-                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"tapped\":true}}", r.id);
+                uint64_t seq = g_nextInputSequence.fetch_add(1);
+                uint64_t ms = (uint64_t)PIC_FullIndex();
+                RecordInputReceipt(seq, "keyboard", ms);
+                dynResp = "{\"id\":" + std::to_string(r.id) + ",\"ok\":true,\"result\":{\"tapped\":true," +
+                    ReceiptFieldsJson(seq, ms) + "}}";
                 break;
-            case AIInputOp::MouseMoveRelative:
+            }
+            case AIInputOp::MouseMoveRelative: {
                 Mouse_CursorMoved(r.dx, r.dy, 0.0f, 0.0f, true);
-                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"moved\":true}}", r.id);
+                uint64_t seq = g_nextInputSequence.fetch_add(1);
+                uint64_t ms = (uint64_t)PIC_FullIndex();
+                RecordInputReceipt(seq, "mouse", ms);
+                dynResp = "{\"id\":" + std::to_string(r.id) + ",\"ok\":true,\"result\":{\"moved\":true," +
+                    ReceiptFieldsJson(seq, ms) + "}}";
                 break;
-            case AIInputOp::MouseButtonSet:
+            }
+            case AIInputOp::MouseButtonSet: {
                 if (r.pressed) {
                     Mouse_ButtonPressed(r.button);
                     g_heldButtons[r.conn].insert(r.button);
@@ -888,15 +983,29 @@ void DEBUG_AI_CheckPendingInput(void) {
                     Mouse_ButtonReleased(r.button);
                     g_heldButtons[r.conn].erase(r.button);
                 }
-                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"pressed\":%s}}",
-                    r.id, r.pressed ? "true" : "false");
+                uint64_t seq = g_nextInputSequence.fetch_add(1);
+                uint64_t ms = (uint64_t)PIC_FullIndex();
+                RecordInputReceipt(seq, "mouse", ms);
+                dynResp = "{\"id\":" + std::to_string(r.id) + ",\"ok\":true,\"result\":{\"pressed\":" +
+                    std::string(r.pressed ? "true" : "false") + "," + ReceiptFieldsJson(seq, ms) + "}}";
                 break;
-            case AIInputOp::MouseButtonClick:
+            }
+            case AIInputOp::MouseButtonClick: {
                 Mouse_ButtonPressed(r.button);
                 Mouse_ButtonReleased(r.button);
-                snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"clicked\":true}}", r.id);
+                uint64_t seq = g_nextInputSequence.fetch_add(1);
+                uint64_t ms = (uint64_t)PIC_FullIndex();
+                RecordInputReceipt(seq, "mouse", ms);
+                dynResp = "{\"id\":" + std::to_string(r.id) + ",\"ok\":true,\"result\":{\"clicked\":true," +
+                    ReceiptFieldsJson(seq, ms) + "}}";
                 break;
+            }
             case AIInputOp::ReleaseAll:
+                /* No receipt: input.release_all is neither input.key.* nor
+                 * input.mouse.* by name, and releases an arbitrary number
+                 * of keys/buttons at once, so no single input_sequence
+                 * would meaningfully describe it -- see the Phase 7C
+                 * design doc's "What gets a receipt" section. */
                 ReleaseAllHeldInput(r.conn);
                 snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"released\":true}}", r.id);
                 break;
@@ -949,20 +1058,22 @@ void DEBUG_AI_CheckPendingInput(void) {
                 g_hasLastGuestXY = true;
 
                 uint64_t seq = g_nextInputSequence.fetch_add(1);
+                uint64_t ms = (uint64_t)PIC_FullIndex();
+                RecordInputReceipt(seq, "mouse", ms);
+
+                std::string common = "\"guest_x\":" + std::to_string(guestX) +
+                    ",\"guest_y\":" + std::to_string(guestY) +
+                    ",\"coordinate_space\":\"guest_pixels\","
+                    "\"clamped\":" + (clamped ? "true" : "false") + "," +
+                    ReceiptFieldsJson(seq, ms);
+
                 if (r.op == AIInputOp::MouseClickAt) {
                     Mouse_ButtonPressed(r.button);
                     Mouse_ButtonReleased(r.button);
-                    snprintf(buf, sizeof(buf),
-                        "{\"id\":%lld,\"ok\":true,\"result\":{\"queued\":true,\"dispatched\":true,"
-                        "\"guest_x\":%lld,\"guest_y\":%lld,\"coordinate_space\":\"guest_pixels\","
-                        "\"clamped\":%s,\"input_sequence\":%llu,\"clicked\":true}}",
-                        r.id, guestX, guestY, clamped ? "true" : "false", (unsigned long long)seq);
+                    dynResp = "{\"id\":" + std::to_string(r.id) + ",\"ok\":true,\"result\":{" +
+                        common + ",\"clicked\":true}}";
                 } else {
-                    snprintf(buf, sizeof(buf),
-                        "{\"id\":%lld,\"ok\":true,\"result\":{\"queued\":true,\"dispatched\":true,"
-                        "\"guest_x\":%lld,\"guest_y\":%lld,\"coordinate_space\":\"guest_pixels\","
-                        "\"clamped\":%s,\"input_sequence\":%llu}}",
-                        r.id, guestX, guestY, clamped ? "true" : "false", (unsigned long long)seq);
+                    dynResp = "{\"id\":" + std::to_string(r.id) + ",\"ok\":true,\"result\":{" + common + "}}";
                 }
                 break;
             }
@@ -2312,6 +2423,33 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
             if (!conn->stopping.load())
                 RespondError("EXECUTION_TIMEOUT", method + " did not complete within the timeout");
         }
+        return;
+    } else if (method == "input.receipt.get") {
+        /* Phase 7C: answered directly here, never queued -- a receipt
+         * describes something that already happened, so this needs only
+         * safe concurrent access to LookupInputReceipt()'s mutex-guarded
+         * history, not emulator-thread execution. Meaningful whether the
+         * debugger is stopped or running. */
+        if (!params) { RespondError("INVALID_PARAMETER", "input.receipt.get requires \"params\""); return; }
+        auto itSeq = params->object.find("input_sequence");
+        if (itSeq == params->object.end() || itSeq->second.type != JsonValue::Type::Number) {
+            RespondError("INVALID_PARAMETER", "params.input_sequence must be a number"); return;
+        }
+        uint64_t seq = (uint64_t)itSeq->second.number;
+
+        InputReceipt receipt;
+        if (!LookupInputReceipt(seq, receipt)) {
+            RespondError("INPUT_RECEIPT_EXPIRED",
+                "no receipt found for that input_sequence (evicted, or never issued)");
+            return;
+        }
+
+        std::string resp = "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":{" +
+            ReceiptFieldsJson(receipt.sequence, receipt.dispatchedAtEmulatedMs) + ","
+            "\"device\":\"" + receipt.device + "\","
+            "\"guest_observation\":{\"kind\":null,\"observed_at_emulated_ms\":null}"
+            "}}";
+        SendLine(conn, resp);
         return;
     } else if (method == "video.frame.capture") {
         /* Unlike input.*, this does NOT require the debugger to be
