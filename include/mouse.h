@@ -48,6 +48,16 @@ bool Mouse_IsLocked();
 void Mouse_BeforeNewVideoMode(bool setmode);
 void Mouse_AfterNewVideoMode(bool setmode);
 
+/* DOSBox-X-AI project (Phase 7B, src/debug/debug_ai.cpp): reports whether
+ * Mouse_CursorMoved(..., emulate=false)'s absolute-positioning branch will
+ * actually move the cursor right now, vs. silently no-op (see that
+ * function, src/ints/mouse.cpp, and docs/
+ * phase7b-mouse-capture-and-absolute-input-design.md). A thin read-only
+ * query, mirroring the existing Mouse_IsLocked() precedent, over
+ * AllowINT33RMAccess()/CurMode/mouse.max_x/max_y -- all file-local to
+ * mouse.cpp and otherwise unreachable from debug_ai.cpp. */
+bool Mouse_AbsolutePositioningAvailable(void);
+
 void UpdateMouseReportRate(void);
 void ChangeMouseReportRate(unsigned int new_rate);
 

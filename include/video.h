@@ -99,6 +99,16 @@ void CaptureMouseNotify(bool capture);
 extern bool mouselocked; //true if mouse is confined to window
 extern volatile bool vmware_mouse;
 
+/* DOSBox-X-AI project (Phase 7B, src/debug/debug_ai.cpp): reports the
+ * "autolock" config option's live value (SDL_Block.mouse.autoenable,
+ * sdlmain.cpp -- note the confusing upstream naming: the "autolock"
+ * dosbox-x.conf key populates .autoenable, while a DIFFERENT field,
+ * .autolock, tracks something else entirely). SDL_Block itself is not
+ * exposed outside sdlmain.cpp, so this is a thin read-only accessor,
+ * mirroring mouselocked/GFX_CaptureMouse() above rather than exporting
+ * the whole struct. */
+bool GFX_MouseAutoLockEnabled(void);
+
 void VMWARE_MouseButtonPressed(uint8_t button);
 void VMWARE_MouseButtonReleased(uint8_t button);
 void VMWARE_MousePosition(uint16_t pos_x, uint16_t pos_y);

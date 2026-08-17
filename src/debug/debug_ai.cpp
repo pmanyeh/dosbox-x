@@ -49,6 +49,8 @@
 #include "logging.h"
 #include "pic.h"
 #include "hardware.h"
+#include "render.h"
+#include "video.h"
 
 #if (C_SSHOT)
 #include <zlib.h>
@@ -318,7 +320,10 @@ enum class AIMethod {
     MemoryWrite, RegisterWrite,
     BreakpointSet, ProtectedMemoryBreakpointSet, RealMemoryBreakpointSet, BreakpointDelete, BreakpointList,
     ExecutionContinue,
-    ExecutionStepInto, ExecutionStepOver
+    ExecutionStepInto, ExecutionStepOver,
+    /* Phase 7B: the "stopped" half of input.mouse.capture.get/.set's dual
+     * route -- see "Mouse capture & absolute input (Phase 7B)" below. */
+    MouseCaptureGet, MouseCaptureSet
 };
 
 struct AIRequestItem {
@@ -333,6 +338,7 @@ struct AIRequestItem {
     std::string regName;              /* register.write -- already whitelist-checked */
     uint32_t regValue = 0;            /* register.write */
     long long breakpointIndex = -1;   /* breakpoint.delete */
+    bool mouseCaptureDesired = false; /* input.mouse.capture.set, stopped route */
 };
 
 static std::atomic<bool> g_bridgeRunning{false};
@@ -618,7 +624,12 @@ void DEBUG_AI_CompletePendingSteps(void) {
 enum class AIInputOp {
     KeyDown, KeyUp, KeyTap,
     MouseMoveRelative, MouseButtonSet, MouseButtonClick,
-    ReleaseAll
+    ReleaseAll,
+    /* Phase 7B: the "running" half of input.mouse.capture.get/.set's dual
+     * route, plus input.mouse.move_absolute/click_at (always running-only,
+     * like every other guest-input op above) -- see "Mouse capture &
+     * absolute input (Phase 7B)" below. */
+    MouseCaptureGet, MouseCaptureSet, MouseMoveAbsolute, MouseClickAt
 };
 
 struct PendingInputRequest {
@@ -631,6 +642,11 @@ struct PendingInputRequest {
     bool pressed = false;
     float dx = 0.0f;
     float dy = 0.0f;
+    double x = 0.0;              /* move_absolute/click_at */
+    double y = 0.0;              /* move_absolute/click_at */
+    bool normalized = false;     /* move_absolute/click_at: x/y space */
+    bool clamp = false;          /* move_absolute/click_at */
+    bool captureDesired = false; /* MouseCaptureSet, running route */
 };
 
 static std::mutex g_inputMutex;
@@ -721,6 +737,105 @@ static void ReleaseAllHeldInput(const std::shared_ptr<AIConnection> &conn) {
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Mouse capture & absolute input (Phase 7B)                           */
+/*                                                                      */
+/* input.mouse.capture.get/.set work whether the debugger is stopped or */
+/* running (unlike every input.* method above) -- see docs/             */
+/* phase7b-mouse-capture-and-absolute-input-design.md for the full      */
+/* design. Both are serviced by the SAME two helpers below regardless   */
+/* of which of the two existing drain mechanisms (g_requestQueue/       */
+/* DEBUG_AI_Poll() while stopped, g_pendingInputs/                      */
+/* DEBUG_AI_CheckPendingInput() while running) reached them, so the two  */
+/* routes can never disagree. input.mouse.move_absolute/click_at, by     */
+/* contrast, dispatch real guest input (Mouse_CursorMoved()/Mouse_*()),  */
+/* so -- like every OTHER input.* method -- they only ever go through    */
+/* the running-only route and are rejected with DEBUGGER_STOPPED while   */
+/* stopped (see HandleLine()).                                          */
+/*                                                                       */
+/* last_guest_x/y and g_nextInputSequence are touched ONLY from the two  */
+/* drain sites above (both exclusively main-thread), mirroring           */
+/* g_heldKeys/g_heldButtons's existing "emulator-thread only" comment    */
+/* above -- no lock needed.                                              */
+/* ------------------------------------------------------------------ */
+
+static std::atomic<uint64_t> g_nextInputSequence{1};
+static bool     g_hasLastGuestXY = false;
+static long long g_lastGuestX = 0;
+static long long g_lastGuestY = 0;
+
+/* render.src.width/height doubled by dblw/dblh -- the SAME formula
+ * UnpackFrameToRGBA8888() (Phase 7A, above) applies, so this always
+ * agrees with video.frame.capture's own reported width/height for the
+ * current video mode. Returns false (leaving outW/outH untouched) before
+ * any video mode has been established. */
+static bool ResolveGuestPixelSize(Bitu &outW, Bitu &outH) {
+    Bitu w = render.src.width  * (render.src.dblw ? 2 : 1);
+    Bitu h = render.src.height * (render.src.dblh ? 2 : 1);
+    if (w == 0 || h == 0) return false;
+    outW = w;
+    outH = h;
+    return true;
+}
+
+/* Shared by both drain routes -- see section comment above. */
+static std::string BuildMouseCaptureStatusResult(long long id) {
+    Bitu w = 0, h = 0;
+    bool haveSize = ResolveGuestPixelSize(w, h);
+    bool absoluteAvailable = Mouse_AbsolutePositioningAvailable();
+
+    return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":{"
+        "\"captured\":" + (mouselocked ? "true" : "false") + ","
+        "\"autolock\":" + (GFX_MouseAutoLockEnabled() ? "true" : "false") + ","
+        "\"mode\":\"" + (absoluteAvailable ? "absolute" : "relative") + "\","
+        "\"guest_width\":" + (haveSize ? std::to_string(w) : "null") + ","
+        "\"guest_height\":" + (haveSize ? std::to_string(h) : "null") + ","
+        "\"last_guest_x\":" + (g_hasLastGuestXY ? std::to_string(g_lastGuestX) : "null") + ","
+        "\"last_guest_y\":" + (g_hasLastGuestXY ? std::to_string(g_lastGuestY) : "null") +
+        "}}";
+}
+
+/* Shared by both drain routes -- see section comment above. GFX_CaptureMouse()
+ * is the EXACT function Ctrl+F10 already calls (src/gui/sdlmain.cpp); no
+ * window focus/host cursor manipulation happens here. */
+static std::string ApplyMouseCaptureSet(long long id, bool desired) {
+    GFX_CaptureMouse(desired);
+    return BuildMouseCaptureStatusResult(id);
+}
+
+/* Resolves one move_absolute/click_at request's requested (x,y) -- in
+ * either coordinate space -- into BOTH the normalized [0,1] coordinates
+ * Mouse_CursorMoved()'s absolute branch consumes AND the resolved
+ * guest-pixel coordinates the response reports (the requirements draft
+ * requires the result to always read "guest_pixels", section 4.1,
+ * regardless of which space the request used). Returns false (and leaves
+ * every out-parameter untouched) if the target falls outside the guest's
+ * pixel bounds and clamp=false -- never a partially-resolved position. */
+static bool ResolveAbsoluteTarget(double reqX, double reqY, bool normalized, bool clamp,
+        Bitu guestW, Bitu guestH,
+        double &outNormX, double &outNormY, long long &outGuestX, long long &outGuestY,
+        bool &outClamped) {
+    const double maxX = guestW > 1 ? (double)(guestW - 1) : 0.0;
+    const double maxY = guestH > 1 ? (double)(guestH - 1) : 0.0;
+
+    double px = normalized ? reqX * maxX : reqX;
+    double py = normalized ? reqY * maxY : reqY;
+
+    outClamped = false;
+    if (px < 0.0 || px > maxX || py < 0.0 || py > maxY) {
+        if (!clamp) return false;
+        px = std::min<double>(std::max<double>(px, 0.0), maxX);
+        py = std::min<double>(std::max<double>(py, 0.0), maxY);
+        outClamped = true;
+    }
+
+    outGuestX = (long long)std::lround(px);
+    outGuestY = (long long)std::lround(py);
+    outNormX = maxX > 0.0 ? px / maxX : 0.0;
+    outNormY = maxY > 0.0 ? py / maxY : 0.0;
+    return true;
+}
+
 /* Drains every queued key/mouse input request and executes it against the
  * SAME KEYBOARD_AddKey()/Mouse_*() entry points real SDL input events use.
  * MUST be called only from the emulator thread, from the Normal_Loop()
@@ -736,8 +851,14 @@ void DEBUG_AI_CheckPendingInput(void) {
     }
 
     for (PendingInputRequest &r : pending) {
-        char buf[192];
+        char buf[384];
         buf[0] = '\0';
+        /* Phase 7B: MouseCaptureGet/Set build a response via
+         * BuildMouseCaptureStatusResult()/ApplyMouseCaptureSet() (variable
+         * length, unlike every fixed-format snprintf() case below) --
+         * dynResp takes priority over buf when non-empty. Freshly
+         * default-constructed (empty) each loop iteration. */
+        std::string dynResp;
 
         switch (r.op) {
             case AIInputOp::KeyDown:
@@ -779,12 +900,79 @@ void DEBUG_AI_CheckPendingInput(void) {
                 ReleaseAllHeldInput(r.conn);
                 snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":true,\"result\":{\"released\":true}}", r.id);
                 break;
+            case AIInputOp::MouseCaptureGet:
+                dynResp = BuildMouseCaptureStatusResult(r.id);
+                break;
+            case AIInputOp::MouseCaptureSet:
+                dynResp = ApplyMouseCaptureSet(r.id, r.captureDesired);
+                break;
+            case AIInputOp::MouseMoveAbsolute:
+            case AIInputOp::MouseClickAt: {
+                if (!Mouse_AbsolutePositioningAvailable()) {
+                    snprintf(buf, sizeof(buf),
+                        "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"ABSOLUTE_MOUSE_UNAVAILABLE\","
+                        "\"message\":\"absolute mouse positioning is not available in the guest's current mode\"}}",
+                        r.id);
+                    break;
+                }
+                Bitu guestW = 0, guestH = 0;
+                if (!ResolveGuestPixelSize(guestW, guestH)) {
+                    snprintf(buf, sizeof(buf),
+                        "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"ABSOLUTE_MOUSE_UNAVAILABLE\","
+                        "\"message\":\"guest video mode not yet established\"}}", r.id);
+                    break;
+                }
+
+                double normX = 0.0, normY = 0.0;
+                long long guestX = 0, guestY = 0;
+                bool clamped = false;
+                if (!ResolveAbsoluteTarget(r.x, r.y, r.normalized, r.clamp, guestW, guestH,
+                        normX, normY, guestX, guestY, clamped)) {
+                    snprintf(buf, sizeof(buf),
+                        "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"INVALID_PARAMETER\","
+                        "\"message\":\"requested coordinates are outside the guest's pixel bounds\"}}", r.id);
+                    break;
+                }
+
+                /* Mouse_CursorMoved()'s emulate=false branch (src/ints/
+                 * mouse.cpp) -- the SAME internal path DOSBox-X's own
+                 * seamless/integrated mouse positioning already uses, not a
+                 * bridge invention. r.op == MouseClickAt performs move +
+                 * button down + button up in THIS single case, before the
+                 * next queued item (if any) can run -- nothing else touches
+                 * the emulator thread between them, satisfying the
+                 * requirements draft's "same emulator-thread dispatch"
+                 * requirement (section 4.1) without a new lock. */
+                Mouse_CursorMoved(0.0f, 0.0f, (float)normX, (float)normY, false);
+                g_lastGuestX = guestX;
+                g_lastGuestY = guestY;
+                g_hasLastGuestXY = true;
+
+                uint64_t seq = g_nextInputSequence.fetch_add(1);
+                if (r.op == AIInputOp::MouseClickAt) {
+                    Mouse_ButtonPressed(r.button);
+                    Mouse_ButtonReleased(r.button);
+                    snprintf(buf, sizeof(buf),
+                        "{\"id\":%lld,\"ok\":true,\"result\":{\"queued\":true,\"dispatched\":true,"
+                        "\"guest_x\":%lld,\"guest_y\":%lld,\"coordinate_space\":\"guest_pixels\","
+                        "\"clamped\":%s,\"input_sequence\":%llu,\"clicked\":true}}",
+                        r.id, guestX, guestY, clamped ? "true" : "false", (unsigned long long)seq);
+                } else {
+                    snprintf(buf, sizeof(buf),
+                        "{\"id\":%lld,\"ok\":true,\"result\":{\"queued\":true,\"dispatched\":true,"
+                        "\"guest_x\":%lld,\"guest_y\":%lld,\"coordinate_space\":\"guest_pixels\","
+                        "\"clamped\":%s,\"input_sequence\":%llu}}",
+                        r.id, guestX, guestY, clamped ? "true" : "false", (unsigned long long)seq);
+                }
+                break;
+            }
         }
 
         if (r.conn && r.expectsResponse) {
+            std::string responseLine = dynResp.empty() ? std::string(buf) : dynResp;
             {
                 std::lock_guard<std::mutex> lk(r.conn->mtx);
-                r.conn->responseLine = buf;
+                r.conn->responseLine = responseLine;
                 r.conn->responseReady = true;
             }
             r.conn->cv.notify_all();
@@ -1208,6 +1396,19 @@ static std::string ExecExecutionStepOver(const AIRequestItem &item) {
     return std::string();
 }
 
+/* Phase 7B: the "stopped" half of input.mouse.capture.get/.set's dual
+ * route -- see "Mouse capture & absolute input (Phase 7B)" above and
+ * docs/phase7b-mouse-capture-and-absolute-input-design.md. Both just call
+ * the SAME shared helpers the "running" route (DEBUG_AI_CheckPendingInput())
+ * uses, so the two routes can never disagree. */
+static std::string ExecMouseCaptureGet(long long id) {
+    return BuildMouseCaptureStatusResult(id);
+}
+
+static std::string ExecMouseCaptureSet(long long id, bool desired) {
+    return ApplyMouseCaptureSet(id, desired);
+}
+
 static std::string ExecCpuGet(long long id) {
     char buf[1024];
     snprintf(buf, sizeof(buf),
@@ -1485,6 +1686,8 @@ static std::string ExecuteRequest(const AIRequestItem &item) {
         case AIMethod::ExecutionContinue: return ExecExecutionContinue(item.id);
         case AIMethod::ExecutionStepInto: return ExecExecutionStepInto(item.id);
         case AIMethod::ExecutionStepOver: return ExecExecutionStepOver(item);
+        case AIMethod::MouseCaptureGet:   return ExecMouseCaptureGet(item.id);
+        case AIMethod::MouseCaptureSet:   return ExecMouseCaptureSet(item.id, item.mouseCaptureDesired);
     }
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"unhandled method\"}}", item.id);
@@ -1951,6 +2154,142 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
             } else {
                 req.op = AIInputOp::MouseButtonClick;
             }
+        }
+
+        LOG(LOG_MISC, LOG_DEBUG)("AI bridge: request id=%lld method=%s", id, method.c_str());
+        {
+            std::lock_guard<std::mutex> lk(conn->mtx);
+            conn->responseReady = false;
+        }
+        DEBUG_AI_RequestInput(req);
+
+        std::unique_lock<std::mutex> lk(conn->mtx);
+        conn->cv.wait_for(lk, std::chrono::seconds(REQUEST_TIMEOUT_SECONDS),
+                           [&] { return conn->responseReady || conn->stopping.load(); });
+        if (conn->responseReady) {
+            std::string resp = conn->responseLine;
+            lk.unlock();
+            SendLine(conn, resp);
+        } else {
+            lk.unlock();
+            DEBUG_AI_CancelInput(conn, id);
+            if (!conn->stopping.load())
+                RespondError("EXECUTION_TIMEOUT", method + " did not complete within the timeout");
+        }
+        return;
+    } else if (method == "input.mouse.capture.get" || method == "input.mouse.capture.set") {
+        /* Phase 7B: unlike every OTHER input.* method, capture status/
+         * toggle is meaningful whether the debugger is stopped or running
+         * -- GFX_CaptureMouse() only touches SDL/window state on the main
+         * thread, never cpu_regs/Segs/guest memory, so there is nothing
+         * unsafe about servicing it while stopped. This branch therefore
+         * picks ONE of two different routes at runtime instead of always
+         * doing one or the other like every branch around it -- see
+         * "Mouse capture & absolute input (Phase 7B)" above and docs/
+         * phase7b-mouse-capture-and-absolute-input-design.md. */
+        bool wantSet = (method == "input.mouse.capture.set");
+        bool desired = false;
+        if (wantSet) {
+            if (!params) { RespondError("INVALID_PARAMETER", "input.mouse.capture.set requires \"params\""); return; }
+            auto itCaptured = params->object.find("captured");
+            if (itCaptured == params->object.end() || itCaptured->second.type != JsonValue::Type::Bool) {
+                RespondError("INVALID_PARAMETER", "params.captured must be a boolean"); return;
+            }
+            desired = itCaptured->second.number != 0;
+        }
+
+        if (g_debuggerActive.load()) {
+            /* Stopped: fall through to the common g_requestQueue push
+             * below, the SAME route debug.status/cpu.get/etc. already
+             * use -- mirrors how the "breakpoint.list" branch above just
+             * sets item.method and falls through rather than returning. */
+            item.method = wantSet ? AIMethod::MouseCaptureSet : AIMethod::MouseCaptureGet;
+            item.mouseCaptureDesired = desired;
+        } else {
+            /* Running: Normal_Loop() never calls DEBUG_AI_Poll(), so route
+             * through g_pendingInputs/DEBUG_AI_CheckPendingInput() instead,
+             * the SAME mechanism input.mouse.move_relative etc. use. */
+            PendingInputRequest req;
+            req.op = wantSet ? AIInputOp::MouseCaptureSet : AIInputOp::MouseCaptureGet;
+            req.conn = conn;
+            req.id = id;
+            req.captureDesired = desired;
+
+            LOG(LOG_MISC, LOG_DEBUG)("AI bridge: request id=%lld method=%s", id, method.c_str());
+            {
+                std::lock_guard<std::mutex> lk(conn->mtx);
+                conn->responseReady = false;
+            }
+            DEBUG_AI_RequestInput(req);
+
+            std::unique_lock<std::mutex> lk(conn->mtx);
+            conn->cv.wait_for(lk, std::chrono::seconds(REQUEST_TIMEOUT_SECONDS),
+                               [&] { return conn->responseReady || conn->stopping.load(); });
+            if (conn->responseReady) {
+                std::string resp = conn->responseLine;
+                lk.unlock();
+                SendLine(conn, resp);
+            } else {
+                lk.unlock();
+                DEBUG_AI_CancelInput(conn, id);
+                if (!conn->stopping.load())
+                    RespondError("EXECUTION_TIMEOUT", method + " did not complete within the timeout");
+            }
+            return;
+        }
+    } else if (method == "input.mouse.move_absolute" || method == "input.mouse.click_at") {
+        /* Unlike capture.get/.set above, these dispatch real guest input
+         * (Mouse_CursorMoved()/Mouse_ButtonPressed()/Mouse_ButtonReleased()),
+         * so -- like every OTHER input.* method -- they only work while
+         * running, never while stopped. */
+        if (g_debuggerActive.load()) {
+            RespondError("DEBUGGER_STOPPED",
+                "cannot inject input while the DOSBox-X debugger is stopped; call execution.continue first");
+            return;
+        }
+        if (!params) { RespondError("INVALID_PARAMETER", method + " requires \"params\""); return; }
+
+        auto itX = params->object.find("x");
+        auto itY = params->object.find("y");
+        if (itX == params->object.end() || itX->second.type != JsonValue::Type::Number ||
+            itY == params->object.end() || itY->second.type != JsonValue::Type::Number) {
+            RespondError("INVALID_PARAMETER", "params.x and params.y must both be numbers"); return;
+        }
+
+        auto itSpace = params->object.find("coordinate_space");
+        if (itSpace == params->object.end() || itSpace->second.type != JsonValue::Type::String) {
+            RespondError("INVALID_PARAMETER", "params.coordinate_space is required"); return;
+        }
+        bool normalized;
+        if (itSpace->second.str == "normalized") normalized = true;
+        else if (itSpace->second.str == "guest_pixels") normalized = false;
+        else { RespondError("INVALID_PARAMETER", "params.coordinate_space must be \"guest_pixels\" or \"normalized\""); return; }
+
+        bool clamp = false;
+        auto itClamp = params->object.find("clamp");
+        if (itClamp != params->object.end() && itClamp->second.type == JsonValue::Type::Bool)
+            clamp = itClamp->second.number != 0;
+
+        PendingInputRequest req;
+        req.op = (method == "input.mouse.click_at") ? AIInputOp::MouseClickAt : AIInputOp::MouseMoveAbsolute;
+        req.conn = conn;
+        req.id = id;
+        req.x = itX->second.number;
+        req.y = itY->second.number;
+        req.normalized = normalized;
+        req.clamp = clamp;
+
+        if (method == "input.mouse.click_at") {
+            auto itButton = params->object.find("button");
+            if (itButton == params->object.end() || itButton->second.type != JsonValue::Type::Number) {
+                RespondError("INVALID_PARAMETER", "params.button must be a number"); return;
+            }
+            long long button = (long long)itButton->second.number;
+            if (button < 0 || button > 2) {
+                RespondError("INVALID_PARAMETER", "params.button must be 0 (left), 1 (right), or 2 (middle)");
+                return;
+            }
+            req.button = (uint8_t)button;
         }
 
         LOG(LOG_MISC, LOG_DEBUG)("AI bridge: request id=%lld method=%s", id, method.c_str());

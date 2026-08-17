@@ -2656,6 +2656,10 @@ void GFX_SetShader(const char* src) {
 #endif
 }
 
+bool GFX_MouseAutoLockEnabled(void) {
+    return sdl.mouse.autoenable;
+}
+
 void GFX_ReleaseMouse(void) {
     if (sdl.mouse.locked)
         GFX_CaptureMouse();

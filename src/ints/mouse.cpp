@@ -859,6 +859,19 @@ static bool AllowINT33RMAccess() {
 	return false;
 }
 
+/* See mouse.h for why this exists (Phase 7B, DOSBox-X-AI project). Mirrors
+ * EXACTLY the condition Mouse_CursorMoved()'s emulate=false branch below
+ * checks before it actually writes mouse.x/mouse.y -- if this returns
+ * false, calling that path would silently do nothing (xrel=yrel=0 makes
+ * its fallback "mouse.x += xrel" branch a no-op), not fail loudly, so
+ * callers outside this file must check this FIRST rather than infer
+ * success from the (void) call. */
+bool Mouse_AbsolutePositioningAvailable(void) {
+    if (!AllowINT33RMAccess() || CurMode == NULL) return false;
+    if (CurMode->type == M_TEXT) return true;
+    return mouse.max_x > 0 && mouse.max_y > 0;
+}
+
 #if C_DEBUG
 bool IsDebuggerActive(void);
 #endif
