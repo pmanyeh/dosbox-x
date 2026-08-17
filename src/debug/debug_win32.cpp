@@ -30,14 +30,26 @@
 	Have to remember where i ripped this code sometime ago.
 
 */
-static void ResizeConsole( HANDLE hConsole, SHORT xSize, SHORT ySize ) {   
-	CONSOLE_SCREEN_BUFFER_INFO csbi; // Hold Current Console Buffer Info 
-	SMALL_RECT srWindowRect;         // Hold the New Console Size 
-	COORD coordScreen;    
-	
-	GetConsoleScreenBufferInfo( hConsole, &csbi );
-	
-	// Get the Largest Size we can size the Console Window to 
+static void ResizeConsole( HANDLE hConsole, SHORT xSize, SHORT ySize ) {
+	CONSOLE_SCREEN_BUFFER_INFO csbi; // Hold Current Console Buffer Info
+	SMALL_RECT srWindowRect;         // Hold the New Console Size
+	COORD coordScreen;
+
+	/* hConsole is not always a real console screen buffer handle here --
+	 * e.g. when dosbox-x.exe is launched from a shell whose own stdout/
+	 * stdin were never a genuine Win32 console to begin with (MSYS2/Git
+	 * Bash's pty, some non-interactive launch contexts), AllocConsole()
+	 * (WIN32_Console(), below) either fails or the process's inherited
+	 * standard handles still point at whatever they were redirected to
+	 * at process creation, not the new console. GetConsoleScreenBufferInfo
+	 * then fails and previously left csbi entirely uninitialized -- every
+	 * calculation below silently ran on garbage stack memory, occasionally
+	 * corrupting enough state to crash (observed exception 0xc0000409,
+	 * STATUS_STACK_BUFFER_OVERRUN) when this ran from such an environment.
+	 * Bail out instead: there's no real console to resize. */
+	if (!GetConsoleScreenBufferInfo( hConsole, &csbi )) return;
+
+	// Get the Largest Size we can size the Console Window to
 	coordScreen = GetLargestConsoleWindowSize( hConsole );
 	
 	// Define the New Console Window Size and Scroll Position 
