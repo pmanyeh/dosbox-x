@@ -1,4 +1,4 @@
-/*
+﻿/*
  *  Copyright (C) 2002-2021  The DOSBox Team
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -43,6 +43,7 @@
 #include "menudef.h"
 #include "mapper.h"
 #include "drives.h"
+#include "debug.h"
 #include "setup.h"
 #include "support.h"
 #include "parport.h"
@@ -1007,6 +1008,72 @@ void HostAppRun() {
 # define MSKANJI_DEVICE_HANDLE 0x1a51
 # define IBMJP_DEVICE_HANDLE 0x1a52
 # define AVSDRV_DEVICE_HANDLE 0x1a53
+#endif
+
+#if C_DEBUG
+/* Phase 7E (DOSBox-X-AI project): shared by all five DEBUG_AI_LogDosIoEvent()
+ * call sites below (open/close/read/write/lseek) -- resolves a DOS file
+ * handle to its DOS-side path ("C:\GAME\GPLDATA.GFF") and, if the file's
+ * drive is a real mounted host directory (localDrive), the corresponding
+ * canonical host path. Both left empty (mapped to JSON null by
+ * debug_ai.cpp) if unresolvable -- e.g. an already-closed handle, or a
+ * drive type with no host directory (image-mounted, ISO, network). See
+ * docs/phase7e-dos-io-event-log-design.md. */
+static void AI_ResolveDosIoPaths(uint16_t rawHandle, std::string &pathDosOut, std::string &pathHostOut) {
+    pathDosOut.clear();
+    pathHostOut.clear();
+
+    uint8_t handle = RealHandle(rawHandle);
+    if (handle >= DOS_FILES || !Files[handle]) return;
+
+    DOS_File *f = Files[handle];
+    const char *name = f->GetName();
+    uint8_t drive = f->GetDrive();
+    if (!name || drive >= DOS_DRIVES) return;
+
+    pathDosOut += (char)('A' + drive);
+    pathDosOut += ':';
+    if (name[0] != '\\') pathDosOut += '\\';
+    pathDosOut += name;
+
+    if (Drives[drive]) {
+        localDrive *ld = dynamic_cast<localDrive*>(Drives[drive]);
+        if (ld) {
+            std::string hostPath = ld->GetHostName(name);
+            if (!hostPath.empty()) pathHostOut = hostPath;
+        }
+    }
+}
+
+/* Reads the calling program's own return address off the stack -- the
+ * standard INT frame (IP, CS, FLAGS pushed in that order), the SAME
+ * precedent this file's own DOS_21Handler() already relies on elsewhere
+ * (mem_readw(SegPhys(ss)+reg_sp[+2]), see e.g. its AH=4Ch handling) --
+ * reg_cs/reg_eip at this point reflect DOS_21Handler()'s OWN installed-
+ * callback mechanism, not the calling program. */
+static void AI_GetDosIoCaller(uint16_t &callerCs, uint16_t &callerIp) {
+    callerIp = mem_readw(SegPhys(ss) + reg_sp);
+    callerCs = mem_readw(SegPhys(ss) + reg_sp + 2);
+}
+
+/* The real carry flag a DOS_21Handler() caller will observe on return.
+ * CALLBACK_SCF()/CALLBACK_SET_FLAG() (src/cpu/callback.cpp) do NOT touch
+ * the live reg_flags at all -- they patch the FLAGS word already saved on
+ * the stack for the pending IRET-equivalent return (real_readw/real_writew
+ * at SS:SP+4, the word past the far return address), since that stacked
+ * copy is what actually gets popped into the CPU when the callback
+ * returns to the caller. reg_flags at this point reflects whatever the
+ * CPU's flags happen to be WHILE INSIDE the callback -- unrelated, and
+ * the reason an earlier version of this hook silently misreported carry
+ * for every event (verified live: every open/seek/read/write/close
+ * showed carry=false, including with a request that genuinely failed).
+ * Read the SAME stacked location CALLBACK_SET_FLAG() itself reads/writes,
+ * matching real mode's 16-bit stack frame (DOS file I/O is real-mode
+ * only in this bridge's scope, see docs/phase7e-dos-io-event-log-design.md). */
+static bool AI_GetDosIoCarry(void) {
+    uint16_t stackedFlags = real_readw(SegValue(ss), reg_sp + 4);
+    return (stackedFlags & 1) != 0;
+}
 #endif
 
 /* called by shell to flush keyboard buffer right before executing the program to avoid
@@ -2005,6 +2072,25 @@ static Bitu DOS_21Handler(void) {
                 }
             }
             force_sfn = false;
+#if C_DEBUG
+            if (DEBUG_AI_DosIoLoggingEnabled()) {
+                uint16_t callerCs, callerIp;
+                AI_GetDosIoCaller(callerCs, callerIp);
+                bool carry = AI_GetDosIoCarry();
+                std::string pathDos, pathHost;
+                if (!carry) AI_ResolveDosIoPaths(reg_ax, pathDos, pathHost);
+                DEBUG_AI_LogDosIoEvent("open", callerCs, callerIp, dos.psp(),
+                    /*hasHandle=*/!carry, /*handle=*/(uint16_t)(carry ? 0 : reg_ax),
+                    /*pathDos=*/!carry && !pathDos.empty() ? pathDos.c_str() : (carry ? name1 : nullptr),
+                    /*pathHost=*/!pathHost.empty() ? pathHost.c_str() : nullptr,
+                    /*hasFileOffsetBefore=*/false, 0,
+                    /*hasRequestedBytes=*/false, 0,
+                    /*hasTransferredBytes=*/false, 0,
+                    /*hasBuffer=*/false, 0, 0, 0,
+                    carry, reg_ax,
+                    /*hasDosError=*/carry, /*dosError=*/(uint16_t)(carry ? reg_ax : 0));
+            }
+#endif
             break;
 		}
         case 0x3e:      /* CLOSE Close file */
@@ -2028,6 +2114,19 @@ static Bitu DOS_21Handler(void) {
             }
             uint8_t handle = RealHandle(reg_bx);
             uint8_t drive = (handle != 0xff && Files[handle]) ? Files[handle]->GetDrive() : DOS_DRIVES;
+#if C_DEBUG
+            std::string aiCloseFileOffsetPathDos, aiCloseFileOffsetPathHost;
+            bool aiCloseHadOffset = false; uint32_t aiCloseOffset = 0;
+            if (DEBUG_AI_DosIoLoggingEnabled()) {
+                /* Resolve BEFORE DOS_CloseFile() below -- Files[handle]
+                 * is no longer valid once the file is actually closed. */
+                AI_ResolveDosIoPaths(reg_bx, aiCloseFileOffsetPathDos, aiCloseFileOffsetPathHost);
+                if (handle != 0xff && Files[handle]) {
+                    uint32_t pos = Files[handle]->GetSeekPos();
+                    if (pos != 0xffffffff) { aiCloseHadOffset = true; aiCloseOffset = pos; }
+                }
+            }
+#endif
             unmask_irq0 |= disk_io_unmask_irq0;
             if (DOS_CloseFile(reg_bx, false, &reg_al)) {
 #if defined(USE_TTF)
@@ -2041,6 +2140,23 @@ static Bitu DOS_21Handler(void) {
                 reg_ax=dos.errorcode;
                 CALLBACK_SCF(true);
             }
+#if C_DEBUG
+            if (DEBUG_AI_DosIoLoggingEnabled()) {
+                uint16_t callerCs, callerIp;
+                AI_GetDosIoCaller(callerCs, callerIp);
+                bool carry = AI_GetDosIoCarry();
+                DEBUG_AI_LogDosIoEvent("close", callerCs, callerIp, dos.psp(),
+                    /*hasHandle=*/true, reg_bx,
+                    aiCloseFileOffsetPathDos.empty() ? nullptr : aiCloseFileOffsetPathDos.c_str(),
+                    aiCloseFileOffsetPathHost.empty() ? nullptr : aiCloseFileOffsetPathHost.c_str(),
+                    aiCloseHadOffset, aiCloseOffset,
+                    /*hasRequestedBytes=*/false, 0,
+                    /*hasTransferredBytes=*/false, 0,
+                    /*hasBuffer=*/false, 0, 0, 0,
+                    carry, reg_ax,
+                    /*hasDosError=*/carry, /*dosError=*/(uint16_t)(carry ? reg_ax : 0));
+            }
+#endif
             break;
         }
         case 0x3f:      /* READ Read from file or device */
@@ -2048,8 +2164,16 @@ static Bitu DOS_21Handler(void) {
             /* TODO: If handle is STDIN and not binary do CTRL+C checking */
             { 
                 uint16_t toread=reg_cx;
+                uint16_t aiRequestedBytes=reg_cx;
                 uint32_t handle = RealHandle(reg_bx);
                 bool fRead = false;
+#if C_DEBUG
+                bool aiHadOffsetBefore = false; uint32_t aiOffsetBefore = 0;
+                if (DEBUG_AI_DosIoLoggingEnabled() && handle < DOS_FILES && Files[handle]) {
+                    uint32_t pos = Files[handle]->GetSeekPos();
+                    if (pos != 0xffffffff) { aiHadOffsetBefore = true; aiOffsetBefore = pos; }
+                }
+#endif
 
                 /* if the offset and size exceed the end of the 64KB segment,
                  * truncate the read according to observed MS-DOS 5.0 behavior
@@ -2126,6 +2250,25 @@ static Bitu DOS_21Handler(void) {
                     reg_ax=dos.errorcode;
                     CALLBACK_SCF(true);
                 }
+#if C_DEBUG
+                if (DEBUG_AI_DosIoLoggingEnabled()) {
+                    uint16_t callerCs, callerIp;
+                    AI_GetDosIoCaller(callerCs, callerIp);
+                    bool carry = AI_GetDosIoCarry();
+                    std::string pathDos, pathHost;
+                    AI_ResolveDosIoPaths(reg_bx, pathDos, pathHost);
+                    DEBUG_AI_LogDosIoEvent("read", callerCs, callerIp, dos.psp(),
+                        /*hasHandle=*/true, reg_bx,
+                        pathDos.empty() ? nullptr : pathDos.c_str(),
+                        pathHost.empty() ? nullptr : pathHost.c_str(),
+                        aiHadOffsetBefore, aiOffsetBefore,
+                        /*hasRequestedBytes=*/true, aiRequestedBytes,
+                        /*hasTransferredBytes=*/!carry, (uint32_t)(carry ? 0 : toread),
+                        /*hasBuffer=*/true, SegValue(ds), reg_dx, (uint32_t)(SegPhys(ds) + reg_dx),
+                        carry, reg_ax,
+                        /*hasDosError=*/carry, /*dosError=*/(uint16_t)(carry ? reg_ax : 0));
+                }
+#endif
                 dos.echo=false;
                 break;
             }
@@ -2133,7 +2276,18 @@ static Bitu DOS_21Handler(void) {
             unmask_irq0 |= disk_io_unmask_irq0;
             {
                 uint16_t towrite=reg_cx;
+                uint16_t aiRequestedBytes=reg_cx;
                 bool fWritten;
+#if C_DEBUG
+                bool aiHadOffsetBefore = false; uint32_t aiOffsetBefore = 0;
+                if (DEBUG_AI_DosIoLoggingEnabled()) {
+                    uint32_t aiHandle = RealHandle(reg_bx);
+                    if (aiHandle < DOS_FILES && Files[aiHandle]) {
+                        uint32_t pos = Files[aiHandle]->GetSeekPos();
+                        if (pos != 0xffffffff) { aiHadOffsetBefore = true; aiOffsetBefore = pos; }
+                    }
+                }
+#endif
 
                 /* if the offset and size exceed the end of the 64KB segment,
                  * truncate the write according to observed MS-DOS 5.0 READ behavior
@@ -2179,6 +2333,25 @@ static Bitu DOS_21Handler(void) {
                     reg_ax=dos.errorcode;
                     CALLBACK_SCF(true);
                 }
+#if C_DEBUG
+                if (DEBUG_AI_DosIoLoggingEnabled()) {
+                    uint16_t callerCs, callerIp;
+                    AI_GetDosIoCaller(callerCs, callerIp);
+                    bool carry = AI_GetDosIoCarry();
+                    std::string pathDos, pathHost;
+                    AI_ResolveDosIoPaths(reg_bx, pathDos, pathHost);
+                    DEBUG_AI_LogDosIoEvent("write", callerCs, callerIp, dos.psp(),
+                        /*hasHandle=*/true, reg_bx,
+                        pathDos.empty() ? nullptr : pathDos.c_str(),
+                        pathHost.empty() ? nullptr : pathHost.c_str(),
+                        aiHadOffsetBefore, aiOffsetBefore,
+                        /*hasRequestedBytes=*/true, aiRequestedBytes,
+                        /*hasTransferredBytes=*/!carry, (uint32_t)(carry ? 0 : towrite),
+                        /*hasBuffer=*/true, SegValue(ds), reg_dx, (uint32_t)(SegPhys(ds) + reg_dx),
+                        carry, reg_ax,
+                        /*hasDosError=*/carry, /*dosError=*/(uint16_t)(carry ? reg_ax : 0));
+                }
+#endif
                 break;
             }
         case 0x41:                  /* UNLINK Delete file */
@@ -2198,6 +2371,16 @@ static Bitu DOS_21Handler(void) {
             unmask_irq0 |= disk_io_unmask_irq0;
             {
                 uint32_t pos=((uint32_t)reg_cx << 16u) + reg_dx;
+#if C_DEBUG
+                bool aiHadOffsetBefore = false; uint32_t aiOffsetBefore = 0;
+                if (DEBUG_AI_DosIoLoggingEnabled()) {
+                    uint32_t aiHandle = RealHandle(reg_bx);
+                    if (aiHandle < DOS_FILES && Files[aiHandle]) {
+                        uint32_t curPos = Files[aiHandle]->GetSeekPos();
+                        if (curPos != 0xffffffff) { aiHadOffsetBefore = true; aiOffsetBefore = curPos; }
+                    }
+                }
+#endif
                 if (DOS_SeekFile(reg_bx,&pos,reg_al)) {
                     reg_dx=(uint16_t)((unsigned int)pos >> 16u);
                     reg_ax=(uint16_t)(pos & 0xFFFF);
@@ -2207,6 +2390,25 @@ static Bitu DOS_21Handler(void) {
                     reg_ax=dos.errorcode;
                     CALLBACK_SCF(true);
                 }
+#if C_DEBUG
+                if (DEBUG_AI_DosIoLoggingEnabled()) {
+                    uint16_t callerCs, callerIp;
+                    AI_GetDosIoCaller(callerCs, callerIp);
+                    bool carry = AI_GetDosIoCarry();
+                    std::string pathDos, pathHost;
+                    AI_ResolveDosIoPaths(reg_bx, pathDos, pathHost);
+                    DEBUG_AI_LogDosIoEvent("seek", callerCs, callerIp, dos.psp(),
+                        /*hasHandle=*/true, reg_bx,
+                        pathDos.empty() ? nullptr : pathDos.c_str(),
+                        pathHost.empty() ? nullptr : pathHost.c_str(),
+                        aiHadOffsetBefore, aiOffsetBefore,
+                        /*hasRequestedBytes=*/false, 0,
+                        /*hasTransferredBytes=*/false, 0,
+                        /*hasBuffer=*/false, 0, 0, 0,
+                        carry, reg_ax,
+                        /*hasDosError=*/carry, /*dosError=*/(uint16_t)(carry ? reg_ax : 0));
+                }
+#endif
                 break;
             }
         case 0x43:                  /* Get/Set file attributes */

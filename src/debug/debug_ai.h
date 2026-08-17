@@ -340,6 +340,66 @@ bool DEBUG_AI_GetHeavyLogEntry(uint32_t indexFromMostRecent, DEBUG_AI_HeavyLogEn
  * last call (e.g. a manual pause with no breakpoint involved). */
 bool DEBUG_AI_GetLastBreakpointHit(bool &isMemory, int32_t &breakpointIndex);
 
+/* ------------------------------------------------------------------ */
+/* DOS file I/O event log (Phase 7E)                                   */
+/*                                                                      */
+/* dos.io.configure/.list/.clear -- see docs/                           */
+/* phase7e-dos-io-event-log-design.md for the full design and source    */
+/* investigation. Five one-line hooks inside DOS_21Handler()             */
+/* (src/dos/dos.cpp, AH=3Dh/3Eh/3Fh/40h/42h -- open/close/read/write/    */
+/* lseek) call DEBUG_AI_LogDosIoEvent() at the exact point each service   */
+/* has already computed its real post-call result (AX/carry/transferred  */
+/* bytes), never a request/response guess. Unlike Phase 7D's per-         */
+/* instruction heavy-log reuse, DOS file I/O is comparatively rare, so    */
+/* this uses one plain mutex (debug_ai.cpp) guarding both the             */
+/* configuration and the event ring buffer -- every dos.io.* method,      */
+/* including dos.io.configure, is answered directly from whichever        */
+/* socket thread receives it, no dual route needed. Only the "is          */
+/* logging enabled at all" check (DEBUG_AI_DosIoLoggingEnabled() below)   */
+/* is a lock-free atomic, so the disabled fast path inside                */
+/* DOS_21Handler() costs one relaxed load, not a mutex acquisition.       */
+/* ------------------------------------------------------------------ */
+
+/* Implemented in debug_ai.cpp. Called from dos.cpp BEFORE gathering any
+ * of DEBUG_AI_LogDosIoEvent()'s arguments below -- lets the (far more
+ * common) disabled case skip all of that string/lookup work entirely. */
+bool DEBUG_AI_DosIoLoggingEnabled(void);
+
+/* Implemented in debug_ai.cpp; declared again in include/debug.h (like
+ * DEBUG_AI_CheckPendingFrameCapture() above) so dos.cpp -- which does not
+ * otherwise depend on src/debug/ -- can call it without a new include
+ * dependency. A flat parameter list rather than a struct, for the same
+ * reason: a struct shared across this header and debug.h would need to
+ * be defined identically in both, an easy way for the two to drift.
+ * Applies the operations/path_globs/include_failed filter, assigns an
+ * event_id, and stores the result (or drops it, per the requirements
+ * draft's "an event that fails the filter must not occupy the ring
+ * buffer") -- safe to call from the emulator thread (the only thread
+ * DOS_21Handler() ever runs on) regardless of whether logging is
+ * enabled; checks DEBUG_AI_DosIoLoggingEnabled() itself too, so callers
+ * that already checked it first pay no double cost, but callers that
+ * didn't still get correct (safe, cheap) disabled-path behavior.
+ *
+ * Nullable fields use a separate has* bool rather than a sentinel value,
+ * so "genuinely zero" and "not available" are never confused (matching
+ * this project's "unavailable is null, never guessed" rule). pathDos/
+ * pathHost are NULL, not empty string, when unavailable. See docs/
+ * phase7e-dos-io-event-log-design.md for where each argument comes from. */
+void DEBUG_AI_LogDosIoEvent(
+    const char *operation,        /* "open"|"close"|"read"|"write"|"seek" */
+    uint16_t callerCs, uint16_t callerIp, /* caller's return address, off the stack */
+    uint16_t pspSegment,
+    bool hasHandle, uint16_t handle,
+    const char *pathDos,          /* NULL if unknown */
+    const char *pathHost,         /* NULL if unknown (not a localDrive, or
+                                    * the file no longer stat()s) */
+    bool hasFileOffsetBefore, uint32_t fileOffsetBefore,
+    bool hasRequestedBytes, uint32_t requestedBytes,
+    bool hasTransferredBytes, uint32_t transferredBytes,
+    bool hasBuffer, uint16_t bufSeg, uint16_t bufOff, uint32_t bufLinear,
+    bool carry, uint16_t ax,
+    bool hasDosError, uint16_t dosError);
+
 #endif
 
 #endif

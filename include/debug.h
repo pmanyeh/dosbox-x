@@ -67,6 +67,32 @@ void DEBUG_AI_CheckPendingInput(void);
 void DEBUG_AI_CheckPendingFrameCapture(Bitu width, Bitu height, Bitu bpp, Bitu pitch,
     Bitu flags, const uint8_t *data, const uint8_t *pal);
 
+/* Phase 7E (DOSBox-X-AI project, src/debug/debug_ai.cpp): DOS file I/O
+ * event log. Declared again here (as well as in debug_ai.h) so dos.cpp
+ * -- which does not otherwise depend on src/debug/ -- can call these
+ * from its INT 21h AH=3Dh/3Eh/3Fh/40h/42h (open/close/read/write/lseek)
+ * handlers without a new include dependency. See docs/
+ * phase7e-dos-io-event-log-design.md and debug_ai.h's own comments for
+ * the full design and what each DEBUG_AI_LogDosIoEvent() argument means.
+ * DEBUG_AI_DosIoLoggingEnabled() is a single relaxed atomic load --
+ * check it first and skip gathering the rest of the arguments below
+ * when it's false, so a disabled configuration costs almost nothing on
+ * this comparatively rare (not per-instruction) hot path. */
+bool DEBUG_AI_DosIoLoggingEnabled(void);
+void DEBUG_AI_LogDosIoEvent(
+    const char *operation,
+    uint16_t callerCs, uint16_t callerIp,
+    uint16_t pspSegment,
+    bool hasHandle, uint16_t handle,
+    const char *pathDos,
+    const char *pathHost,
+    bool hasFileOffsetBefore, uint32_t fileOffsetBefore,
+    bool hasRequestedBytes, uint32_t requestedBytes,
+    bool hasTransferredBytes, uint32_t transferredBytes,
+    bool hasBuffer, uint16_t bufSeg, uint16_t bufOff, uint32_t bufLinear,
+    bool carry, uint16_t ax,
+    bool hasDosError, uint16_t dosError);
+
 extern Bitu cycle_count;
 extern Bitu debugCallback;
 

@@ -2120,6 +2120,168 @@ static std::string BuildTraceGetJson(long long id, const TraceRecord &rec) {
         "}}";
 }
 
+/* ------------------------------------------------------------------ */
+/* DOS file I/O event log (Phase 7E)                                   */
+/*                                                                      */
+/* dos.io.configure/.list/.clear -- see docs/                           */
+/* phase7e-dos-io-event-log-design.md. Unlike every other dual-route     */
+/* (stopped vs. running) method elsewhere in this file, EVERY dos.io.*   */
+/* method -- including .configure -- is answered directly from whichever */
+/* socket thread receives it, under g_dosIoMutex below: DOS file I/O is   */
+/* comparatively rare (nowhere near Phase 7D's per-instruction rate), so  */
+/* a plain mutex shared between the emulator thread (DEBUG_AI_LogDosIoEvent(),*/
+/* called from dos.cpp) and socket threads is cheap enough here, with no  */
+/* need for logHeavy-style lock-free per-instruction design.              */
+/* ------------------------------------------------------------------ */
+
+struct DosIoEvent {
+    uint64_t eventId = 0;
+    uint64_t emulatedMs = 0;
+    std::string operation;
+    uint16_t callerCs = 0, callerIp = 0;
+    uint16_t pspSegment = 0;
+    bool hasHandle = false; uint16_t handle = 0;
+    std::string pathDos;   /* empty == null */
+    std::string pathHost;  /* empty == null */
+    bool hasFileOffsetBefore = false; uint32_t fileOffsetBefore = 0;
+    bool hasRequestedBytes = false;   uint32_t requestedBytes = 0;
+    bool hasTransferredBytes = false; uint32_t transferredBytes = 0;
+    bool hasBuffer = false; uint16_t bufSeg = 0, bufOff = 0; uint32_t bufLinear = 0;
+    bool carry = false;
+    uint16_t ax = 0;
+    bool hasDosError = false; uint16_t dosError = 0;
+};
+
+struct DosIoConfig {
+    bool enabled = false;
+    std::set<std::string> operations;   /* empty == all five */
+    std::vector<std::string> pathGlobs; /* empty == all paths */
+    bool includeFailed = true;
+    uint32_t maxEvents = 10000;
+};
+
+static std::mutex g_dosIoMutex;
+static DosIoConfig g_dosIoConfig;
+static std::deque<DosIoEvent> g_dosIoEvents;
+static uint64_t g_dosIoDroppedEvents = 0;
+static std::atomic<uint64_t> g_nextDosIoEventId{1};
+/* Lock-free mirror of g_dosIoConfig.enabled -- checked from dos.cpp
+ * (DEBUG_AI_DosIoLoggingEnabled()) so the disabled fast path inside
+ * DOS_21Handler() never touches g_dosIoMutex at all. */
+static std::atomic<bool> g_dosIoEnabled{false};
+
+/* Case-insensitive "*"/"?" glob match. DOSBox-X's own WildFileCmp()
+ * (src/dos/drives.cpp) is specifically shaped for legacy 8.3 filenames
+ * (splits into an 8-char name + 3-char extension) -- too narrow for
+ * matching a full path like "SAVE-*" against path_dos. This mirrors the
+ * same recursive-backtracking shape as that file's sibling wild_match()
+ * helper, just made explicitly case-insensitive with its own signature
+ * rather than depending on that internal helper's case assumptions. */
+static bool DosIoGlobMatch(const std::string &text, const std::string &pattern, size_t ti = 0, size_t pi = 0) {
+    while (pi < pattern.size()) {
+        char pc = pattern[pi];
+        if (pc == '*') {
+            if (pi + 1 == pattern.size()) return true; /* trailing * matches the rest */
+            for (size_t skip = ti; skip <= text.size(); skip++) {
+                if (DosIoGlobMatch(text, pattern, skip, pi + 1)) return true;
+            }
+            return false;
+        }
+        if (ti >= text.size()) return false;
+        if (pc == '?') {
+            ti++; pi++;
+            continue;
+        }
+        if (toupper((unsigned char)text[ti]) != toupper((unsigned char)pc)) return false;
+        ti++; pi++;
+    }
+    return ti == text.size();
+}
+
+bool DEBUG_AI_DosIoLoggingEnabled(void) {
+    return g_dosIoEnabled.load(std::memory_order_relaxed);
+}
+
+void DEBUG_AI_LogDosIoEvent(
+        const char *operation,
+        uint16_t callerCs, uint16_t callerIp,
+        uint16_t pspSegment,
+        bool hasHandle, uint16_t handle,
+        const char *pathDos,
+        const char *pathHost,
+        bool hasFileOffsetBefore, uint32_t fileOffsetBefore,
+        bool hasRequestedBytes, uint32_t requestedBytes,
+        bool hasTransferredBytes, uint32_t transferredBytes,
+        bool hasBuffer, uint16_t bufSeg, uint16_t bufOff, uint32_t bufLinear,
+        bool carry, uint16_t ax,
+        bool hasDosError, uint16_t dosError) {
+    std::lock_guard<std::mutex> lk(g_dosIoMutex);
+    if (!g_dosIoConfig.enabled) return;
+    if (!g_dosIoConfig.operations.empty() && g_dosIoConfig.operations.find(operation) == g_dosIoConfig.operations.end())
+        return;
+    if (carry && !g_dosIoConfig.includeFailed) return;
+
+    if (!g_dosIoConfig.pathGlobs.empty()) {
+        if (!pathDos) return; /* unresolvable path can never match a configured filter */
+        bool matched = false;
+        for (const std::string &glob : g_dosIoConfig.pathGlobs) {
+            if (DosIoGlobMatch(pathDos, glob)) { matched = true; break; }
+        }
+        if (!matched) return;
+    }
+
+    DosIoEvent rec;
+    rec.eventId = g_nextDosIoEventId.fetch_add(1);
+    rec.emulatedMs = (uint64_t)PIC_FullIndex();
+    rec.operation = operation;
+    rec.callerCs = callerCs; rec.callerIp = callerIp;
+    rec.pspSegment = pspSegment;
+    rec.hasHandle = hasHandle; rec.handle = handle;
+    if (pathDos) rec.pathDos = pathDos;
+    if (pathHost) rec.pathHost = pathHost;
+    rec.hasFileOffsetBefore = hasFileOffsetBefore; rec.fileOffsetBefore = fileOffsetBefore;
+    rec.hasRequestedBytes = hasRequestedBytes; rec.requestedBytes = requestedBytes;
+    rec.hasTransferredBytes = hasTransferredBytes; rec.transferredBytes = transferredBytes;
+    rec.hasBuffer = hasBuffer; rec.bufSeg = bufSeg; rec.bufOff = bufOff; rec.bufLinear = bufLinear;
+    rec.carry = carry;
+    rec.ax = ax;
+    rec.hasDosError = hasDosError; rec.dosError = dosError;
+
+    while (g_dosIoEvents.size() >= g_dosIoConfig.maxEvents) {
+        g_dosIoEvents.pop_front();
+        g_dosIoDroppedEvents++;
+    }
+    g_dosIoEvents.push_back(std::move(rec));
+}
+
+static std::string BuildDosIoEventJson(const DosIoEvent &rec) {
+    char callerLoc[16];
+    snprintf(callerLoc, sizeof(callerLoc), "%04X:%04X", (unsigned)rec.callerCs, (unsigned)rec.callerIp);
+
+    return "{\"event_id\":" + std::to_string(rec.eventId) + ","
+        "\"emulated_ms\":" + std::to_string(rec.emulatedMs) + ","
+        "\"operation\":\"" + rec.operation + "\","
+        "\"phase\":\"completed\","
+        "\"cs_ip\":\"" + callerLoc + "\","
+        "\"process\":{\"psp_segment\":" + std::to_string(rec.pspSegment) + "},"
+        "\"handle\":" + (rec.hasHandle ? std::to_string(rec.handle) : "null") + ","
+        "\"path_dos\":" + (rec.pathDos.empty() ? "null" : ("\"" + JsonEscape(rec.pathDos) + "\"")) + ","
+        "\"path_host\":" + (rec.pathHost.empty() ? "null" : ("\"" + JsonEscape(rec.pathHost) + "\"")) + ","
+        "\"file_offset_before\":" + (rec.hasFileOffsetBefore ? std::to_string(rec.fileOffsetBefore) : "null") + ","
+        "\"requested_bytes\":" + (rec.hasRequestedBytes ? std::to_string(rec.requestedBytes) : "null") + ","
+        "\"transferred_bytes\":" + (rec.hasTransferredBytes ? std::to_string(rec.transferredBytes) : "null") + ","
+        "\"buffer\":{"
+        "\"segment\":" + (rec.hasBuffer ? std::to_string(rec.bufSeg) : "null") + ","
+        "\"offset\":" + (rec.hasBuffer ? std::to_string(rec.bufOff) : "null") + ","
+        "\"linear\":" + (rec.hasBuffer ? std::to_string(rec.bufLinear) : "null") +
+        "},"
+        "\"result\":{"
+        "\"carry\":" + (rec.carry ? "true" : "false") + ","
+        "\"ax\":" + std::to_string(rec.ax) + ","
+        "\"dos_error\":" + (rec.hasDosError ? std::to_string(rec.dosError) : "null") +
+        "}}";
+}
+
 static std::string ExecuteRequest(const AIRequestItem &item) {
     switch (item.method) {
         case AIMethod::DebugStatus:      return ExecDebugStatus(item.id);
@@ -2967,6 +3129,133 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
             return;
         }
         SendLine(conn, resp);
+        return;
+    } else if (method == "dos.io.configure") {
+        /* Phase 7E: answered directly, like every other dos.io.* method
+         * -- see "DOS file I/O event log (Phase 7E)" above for why this
+         * needs no dual route (unlike trace.execution.configure/
+         * capture.set) despite also being a configuration write. */
+        if (!params) { RespondError("INVALID_PARAMETER", "dos.io.configure requires \"params\""); return; }
+
+        DosIoConfig cfg;
+        auto itEnabled = params->object.find("enabled");
+        if (itEnabled == params->object.end() || itEnabled->second.type != JsonValue::Type::Bool) {
+            RespondError("INVALID_PARAMETER", "params.enabled must be a boolean"); return;
+        }
+        cfg.enabled = itEnabled->second.number != 0;
+
+        static const std::set<std::string> validOps = {"open","close","read","write","seek"};
+        auto itOps = params->object.find("operations");
+        if (itOps != params->object.end()) {
+            if (itOps->second.type != JsonValue::Type::Array) { RespondError("INVALID_PARAMETER", "params.operations must be an array of strings"); return; }
+            for (const JsonValue &v : itOps->second.array) {
+                if (v.type != JsonValue::Type::String || validOps.find(v.str) == validOps.end()) {
+                    RespondError("INVALID_PARAMETER", "params.operations entries must be one of open/close/read/write/seek");
+                    return;
+                }
+                cfg.operations.insert(v.str);
+            }
+        }
+        auto itGlobs = params->object.find("path_globs");
+        if (itGlobs != params->object.end()) {
+            if (itGlobs->second.type != JsonValue::Type::Array) { RespondError("INVALID_PARAMETER", "params.path_globs must be an array of strings"); return; }
+            for (const JsonValue &v : itGlobs->second.array) {
+                if (v.type != JsonValue::Type::String) { RespondError("INVALID_PARAMETER", "params.path_globs entries must be strings"); return; }
+                cfg.pathGlobs.push_back(v.str);
+            }
+        }
+        auto itIncludeFailed = params->object.find("include_failed");
+        if (itIncludeFailed != params->object.end()) {
+            if (itIncludeFailed->second.type != JsonValue::Type::Bool) { RespondError("INVALID_PARAMETER", "params.include_failed must be a boolean"); return; }
+            cfg.includeFailed = itIncludeFailed->second.number != 0;
+        }
+        auto itMaxEvents = params->object.find("max_events");
+        if (itMaxEvents != params->object.end()) {
+            if (itMaxEvents->second.type != JsonValue::Type::Number) { RespondError("INVALID_PARAMETER", "params.max_events must be a number"); return; }
+            long long v = (long long)itMaxEvents->second.number;
+            if (v < 100 || v > 100000) { RespondError("INVALID_PARAMETER", "params.max_events must be 100..100000"); return; }
+            cfg.maxEvents = (uint32_t)v;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_dosIoMutex);
+            g_dosIoConfig = cfg;
+            while (g_dosIoEvents.size() > cfg.maxEvents) {
+                g_dosIoEvents.pop_front();
+                g_dosIoDroppedEvents++;
+            }
+        }
+        g_dosIoEnabled.store(cfg.enabled, std::memory_order_relaxed);
+
+        std::string resp = "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":{"
+            "\"enabled\":" + (cfg.enabled ? "true" : "false") + ","
+            "\"max_events\":" + std::to_string(cfg.maxEvents) +
+            "}}";
+        SendLine(conn, resp);
+        return;
+    } else if (method == "dos.io.list") {
+        long long limit = 1000;
+        uint64_t afterEventId = 0;
+        bool hasAfter = false;
+        std::string opFilter;
+        bool hasOpFilter = false;
+        std::string pathGlobFilter;
+        bool hasPathGlobFilter = false;
+        if (params) {
+            auto itLimit = params->object.find("limit");
+            if (itLimit != params->object.end()) {
+                if (itLimit->second.type != JsonValue::Type::Number) { RespondError("INVALID_PARAMETER", "params.limit must be a number"); return; }
+                limit = (long long)itLimit->second.number;
+                if (limit < 1 || limit > 1000) { RespondError("INVALID_PARAMETER", "params.limit must be 1..1000"); return; }
+            }
+            auto itAfterId = params->object.find("after_event_id");
+            if (itAfterId != params->object.end() && itAfterId->second.type == JsonValue::Type::Number) {
+                afterEventId = (uint64_t)itAfterId->second.number;
+                hasAfter = true;
+            }
+            auto itOp = params->object.find("operation");
+            if (itOp != params->object.end() && itOp->second.type == JsonValue::Type::String) {
+                opFilter = itOp->second.str;
+                hasOpFilter = true;
+            }
+            auto itPathGlob = params->object.find("path_glob");
+            if (itPathGlob != params->object.end() && itPathGlob->second.type == JsonValue::Type::String) {
+                pathGlobFilter = itPathGlob->second.str;
+                hasPathGlobFilter = true;
+            }
+        }
+
+        std::string arr = "[";
+        uint64_t droppedSnapshot;
+        {
+            std::lock_guard<std::mutex> lk(g_dosIoMutex);
+            droppedSnapshot = g_dosIoDroppedEvents;
+            bool first = true;
+            long long emitted = 0;
+            for (const DosIoEvent &rec : g_dosIoEvents) {
+                if (emitted >= limit) break;
+                if (hasAfter && rec.eventId <= afterEventId) continue;
+                if (hasOpFilter && rec.operation != opFilter) continue;
+                if (hasPathGlobFilter && (rec.pathDos.empty() || !DosIoGlobMatch(rec.pathDos, pathGlobFilter))) continue;
+                if (!first) arr += ",";
+                first = false;
+                arr += BuildDosIoEventJson(rec);
+                emitted++;
+            }
+        }
+        arr += "]";
+
+        std::string resp = "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":{"
+            "\"events\":" + arr + ",\"dropped_events\":" + std::to_string(droppedSnapshot) + "}}";
+        SendLine(conn, resp);
+        return;
+    } else if (method == "dos.io.clear") {
+        {
+            std::lock_guard<std::mutex> lk(g_dosIoMutex);
+            g_dosIoEvents.clear();
+            g_dosIoDroppedEvents = 0;
+        }
+        SendLine(conn, "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":{\"cleared\":true}}");
         return;
     } else if (method == "video.frame.capture") {
         /* Unlike input.*, this does NOT require the debugger to be
