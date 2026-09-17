@@ -51,6 +51,7 @@
 #include "hardware.h"
 #include "render.h"
 #include "video.h"
+#include "inout.h"
 
 #if (C_SSHOT)
 #include <zlib.h>
@@ -110,6 +111,34 @@ static const int       REQUEST_TIMEOUT_SECONDS = 5;
  * the stack) and is out of scope until explicitly approved. */
 static const char *WRITABLE_REGISTERS[] = { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp" };
 static const char *BLOCKED_REGISTERS[]  = { "eip", "cs", "ds", "es", "ss", "fs", "gs", "esp", "eflags" };
+
+/* io.write: ports writable through the bridge, added so an agent stopped
+ * at a breakpoint can drive standard VGA registers (e.g. Graphics
+ * Controller index 4, the Read Map Select register, to switch which
+ * plane memory.read observes at A000:xxxx) -- something no existing
+ * bridge method could do, since memory.write only reaches guest RAM, not
+ * I/O space. Deliberately an allowlist of the standard VGA CRTC/
+ * Sequencer/Graphics Controller/Attribute Controller/DAC/Misc Output/
+ * Feature Control ports (mono 0x3Bx and color 0x3Dx addressing, per the
+ * IBM VGA register reference), the same "narrow, named allowlist rather
+ * than a blocklist over the full port space" shape as WRITABLE_REGISTERS
+ * above -- an unrestricted io.write could reach PIC/PIT/disk-controller
+ * ports and desync or hang the guest OS in ways a debugger session has
+ * no way to recover from. Read-only ports in these register groups
+ * (e.g. 0x3CA Feature Control read, 0x3CC Misc Output read) are
+ * deliberately omitted; there is nothing meaningful for a write to do
+ * there. */
+static const uint16_t WRITABLE_IO_PORTS[] = {
+    0x3B4, 0x3B5,               /* CRTC address/data (mono addressing) */
+    0x3BA,                      /* Feature Control (mono addressing) */
+    0x3C0, 0x3C1,                /* Attribute Controller address/data */
+    0x3C2,                      /* Misc Output Register */
+    0x3C4, 0x3C5,                /* Sequencer address/data */
+    0x3C6, 0x3C7, 0x3C8, 0x3C9,   /* DAC pel mask / addr / data */
+    0x3CE, 0x3CF,                /* Graphics Controller address/data */
+    0x3D4, 0x3D5,                /* CRTC address/data (color addressing) */
+    0x3DA,                      /* Feature Control (color addressing) */
+};
 
 /* ------------------------------------------------------------------ */
 /* Minimal JSON value + parser                                         */
@@ -317,7 +346,7 @@ struct AIConnection {
 
 enum class AIMethod {
     DebugStatus, CpuGet, MemoryRead, CodeCurrent, CodeDisassemble,
-    MemoryWrite, RegisterWrite,
+    MemoryWrite, RegisterWrite, IoWrite,
     BreakpointSet, ProtectedMemoryBreakpointSet, RealMemoryBreakpointSet, BreakpointDelete, BreakpointList,
     ExecutionContinue,
     ExecutionStepInto, ExecutionStepOver,
@@ -352,6 +381,9 @@ struct AIRequestItem {
     std::vector<uint8_t> writeBytes;  /* memory.write */
     std::string regName;              /* register.write -- already whitelist-checked */
     uint32_t regValue = 0;            /* register.write */
+    uint16_t ioPort = 0;               /* io.write -- already whitelist-checked */
+    uint32_t ioValue = 0;              /* io.write */
+    int ioWidth = 1;                   /* io.write -- 1, 2, or 4 bytes */
     long long breakpointIndex = -1;   /* breakpoint.delete */
     bool mouseCaptureDesired = false; /* input.mouse.capture.set, stopped route */
     TraceConfigParams traceConfig;    /* trace.execution.configure, stopped route */
@@ -1676,6 +1708,25 @@ static std::string ExecRegisterWrite(long long id, const std::string &regName, u
     return std::string(buf);
 }
 
+static std::string ExecIoWrite(long long id, uint16_t port, uint32_t value, int width) {
+    /* port/value/width have already been checked against WRITABLE_IO_PORTS
+     * and range-validated by HandleLine() (socket thread) before this
+     * ever reaches the queue -- this is the actual write, on the
+     * emulator thread, via the same IO_Write*() entry points the rest of
+     * the emulator (device code, debugger console's "IO" command) uses. */
+    switch (width) {
+        case 1: IO_WriteB(port, (uint8_t)value); break;
+        case 2: IO_WriteW(port, (uint16_t)value); break;
+        case 4: IO_WriteD(port, value); break;
+    }
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"id\":%lld,\"ok\":true,\"result\":{\"port\":\"%04X\",\"value\":\"%0*X\",\"width\":%d}}",
+        id, (unsigned)port, width * 2, (unsigned)value, width);
+    return std::string(buf);
+}
+
 static std::string ExecCodeDisassemble(long long id, uint16_t seg, uint32_t off, long long count) {
     std::string arr = "[";
     uint32_t curOff = off;
@@ -2291,6 +2342,7 @@ static std::string ExecuteRequest(const AIRequestItem &item) {
         case AIMethod::CodeDisassemble:  return ExecCodeDisassemble(item.id, item.seg, item.off, item.count);
         case AIMethod::MemoryWrite:      return ExecMemoryWrite(item.id, item.seg, item.off, item.writeBytes);
         case AIMethod::RegisterWrite:    return ExecRegisterWrite(item.id, item.regName, item.regValue);
+        case AIMethod::IoWrite:          return ExecIoWrite(item.id, item.ioPort, item.ioValue, item.ioWidth);
         case AIMethod::BreakpointSet:     return ExecBreakpointSet(item.id, item.seg, item.off);
         case AIMethod::ProtectedMemoryBreakpointSet: return ExecProtectedMemoryBreakpointSet(item.id, item.seg, item.off);
         case AIMethod::RealMemoryBreakpointSet: return ExecRealMemoryBreakpointSet(item.id, item.seg, item.off);
@@ -2632,6 +2684,65 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
 
         item.regName = regName;
         item.regValue = (uint32_t)strtoul(valStr.c_str(), nullptr, 16);
+    } else if (method == "io.write") {
+        item.method = AIMethod::IoWrite;
+        if (!params) { RespondError("INVALID_PARAMETER", "io.write requires \"params\""); return; }
+        auto itPort = params->object.find("port");
+        auto itVal = params->object.find("value");
+        auto itWidth = params->object.find("width");
+        if (itPort == params->object.end() || itPort->second.type != JsonValue::Type::String) {
+            RespondError("INVALID_PARAMETER", "params.port must be a hex string"); return;
+        }
+        if (itVal == params->object.end() || itVal->second.type != JsonValue::Type::String) {
+            RespondError("INVALID_PARAMETER", "params.value must be a hex string"); return;
+        }
+
+        int width = 1;
+        if (itWidth != params->object.end()) {
+            if (itWidth->second.type != JsonValue::Type::Number ||
+                (itWidth->second.number != 1.0 && itWidth->second.number != 2.0 && itWidth->second.number != 4.0)) {
+                RespondError("INVALID_PARAMETER", "params.width must be 1, 2, or 4"); return;
+            }
+            width = (int)itWidth->second.number;
+        }
+
+        const std::string &portStr = itPort->second.str;
+        if (portStr.empty() || portStr.size() > 4) {
+            RespondError("INVALID_PARAMETER", "params.port must be 1-4 hex digits"); return;
+        }
+        for (char c : portStr) {
+            if (!isxdigit((unsigned char)c)) {
+                RespondError("INVALID_PARAMETER", "params.port must be a hex string"); return;
+            }
+        }
+        uint32_t port = (uint32_t)strtoul(portStr.c_str(), nullptr, 16);
+
+        bool isWritable = false;
+        for (uint16_t w : WRITABLE_IO_PORTS) if (port == w) { isWritable = true; break; }
+        if (!isWritable) {
+            RespondError("PORT_NOT_WRITABLE",
+                "writing I/O port " + portStr + " is not permitted (only the standard VGA CRTC/"
+                "Sequencer/Graphics Controller/Attribute Controller/DAC/Misc Output/Feature "
+                "Control ports are whitelisted)");
+            return;
+        }
+
+        const std::string &valStr = itVal->second.str;
+        size_t maxDigits = (size_t)width * 2;
+        if (valStr.empty() || valStr.size() > maxDigits) {
+            RespondError("INVALID_PARAMETER",
+                "params.value must be 1-" + std::to_string(maxDigits) + " hex digits for width " + std::to_string(width));
+            return;
+        }
+        for (char c : valStr) {
+            if (!isxdigit((unsigned char)c)) {
+                RespondError("INVALID_PARAMETER", "params.value must be a hex string"); return;
+            }
+        }
+
+        item.ioPort = (uint16_t)port;
+        item.ioValue = (uint32_t)strtoul(valStr.c_str(), nullptr, 16);
+        item.ioWidth = width;
     } else if (method == "breakpoint.set") {
         item.method = AIMethod::BreakpointSet;
         if (!params) { RespondError("INVALID_PARAMETER", "breakpoint.set requires \"params\""); return; }
