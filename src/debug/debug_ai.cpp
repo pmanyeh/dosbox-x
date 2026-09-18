@@ -52,6 +52,7 @@
 #include "render.h"
 #include "video.h"
 #include "inout.h"
+#include "vga.h"
 
 #if (C_SSHOT)
 #include <zlib.h>
@@ -104,6 +105,12 @@ static const long long MAX_WRITE_LENGTH      = 65536;
 static const long long MAX_DISASSEMBLE_COUNT = 100;
 static const size_t    MAX_FRAME_PAYLOAD_BYTES = 8 * 1024 * 1024;
 static const int       REQUEST_TIMEOUT_SECONDS = 5;
+/* Phase 8A: vga.snapshot -- cap on params.regions array size. Generous
+ * relative to any real diagnostic call (the motivating case needs 4-8
+ * regions); this is a local, single-connection debug bridge, not a
+ * remote-facing service, so the cap exists only to bound one malformed
+ * request's response size, not to defend against abuse. */
+static const size_t    MAX_VGA_SNAPSHOT_REGIONS = 64;
 
 /* Phase 4A: registers writable through register.write. EIP, all segment
  * registers, ESP, and EFLAGS are deliberately excluded -- writing them
@@ -146,8 +153,11 @@ static const uint16_t WRITABLE_IO_PORTS[] = {
 /* This is intentionally not a general-purpose JSON library: it only   */
 /* supports what the AI bridge protocol actually needs (Phase3.md      */
 /* section 8) -- flat objects containing strings/numbers, with at most */
-/* one level of nesting for "params", and flat arrays of strings/numbers */
-/* (used only by memory.write's params.data, an array of byte values).  */
+/* one level of nesting for "params", flat arrays of strings/numbers   */
+/* (used only by memory.write's params.data, an array of byte values), */
+/* and (Phase 8A) one array of flat objects (vga.snapshot's            */
+/* params.regions) -- ParseObject()/ParseArray() are already mutually  */
+/* recursive so this needs no parser changes, just a new consumer.     */
 /* ------------------------------------------------------------------ */
 
 struct JsonValue {
@@ -355,7 +365,19 @@ enum class AIMethod {
     MouseCaptureGet, MouseCaptureSet,
     /* Phase 7D: the "stopped" half of trace.execution.configure's dual
      * route -- see "Execution trace (Phase 7D)" below. */
-    TraceConfigure
+    TraceConfigure,
+    /* Phase 8A: side-effect-free VGA VRAM snapshot -- see
+     * "VGA snapshot (Phase 8A)" below. */
+    VgaSnapshot
+};
+
+/* Phase 8A: one requested (plane, offset, length) region within
+ * vga.snapshot's params.regions -- offset/length are per-plane byte
+ * units, see docs/phase8a-vga-snapshot-design.md. */
+struct VgaSnapshotRegion {
+    uint8_t  plane = 0;
+    uint32_t offset = 0;
+    uint32_t length = 0;
 };
 
 /* Phase 7D: trace.execution.configure's parsed params, shared between the
@@ -387,6 +409,7 @@ struct AIRequestItem {
     long long breakpointIndex = -1;   /* breakpoint.delete */
     bool mouseCaptureDesired = false; /* input.mouse.capture.set, stopped route */
     TraceConfigParams traceConfig;    /* trace.execution.configure, stopped route */
+    std::vector<VgaSnapshotRegion> vgaRegions; /* vga.snapshot -- already range-checked */
 };
 
 static std::atomic<bool> g_bridgeRunning{false};
@@ -1727,6 +1750,117 @@ static std::string ExecIoWrite(long long id, uint16_t port, uint32_t value, int 
     return std::string(buf);
 }
 
+/* Phase 8A: vga.snapshot. Reads ONLY vga.mem.linear/vga.latch/vga.seq/
+ * vga.gfx/vga.crtc plain fields -- never mem_readb_checked()/a PageHandler
+ * (which would latch a byte as a side effect of a normal CPU-visible read,
+ * see docs/phase8a-vga-snapshot-design.md), never IO_Read/Write*(), never
+ * touches cpu_regs/Segs/reg_eip, and never steps or resumes. Reached only
+ * through g_requestQueue/DEBUG_AI_Poll() like ExecMemoryRead()/
+ * ExecIoWrite() above, i.e. only while the debugger is genuinely stopped --
+ * that, plus this function touching nothing else, is what makes "one
+ * snapshot, one consistent instant" automatic rather than something this
+ * function has to arrange itself. */
+static std::string ExecVgaSnapshot(long long id, const std::vector<VgaSnapshotRegion> &regions) {
+    if (!IS_EGAVGA_ARCH || vga.mem.linear == NULL) {
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+            "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"VGA_SNAPSHOT_UNSUPPORTED\","
+            "\"message\":\"vga.snapshot requires an EGA/VGA-family machine (the current "
+            "machine's video memory is not laid out as 4-plane interleaved VRAM)\"}}",
+            id);
+        return std::string(buf);
+    }
+
+    const uint32_t planeSizeBytes = vga.mem.memsize / 4u;
+
+    char head[512];
+    snprintf(head, sizeof(head),
+        "{\"id\":%lld,\"ok\":true,\"result\":{"
+        "\"layout\":\"planar_interleaved_dword\","
+        "\"layout_note\":\"4-plane EGA/VGA VRAM as physically wired: for plane p (0-3) and a "
+        "byte offset o within that plane, the byte lives at native VRAM index o*4+p. "
+        "offset/length here are already per-plane byte units.\","
+        "\"plane_count\":4,"
+        "\"plane_size_bytes\":%u,"
+        "\"latch\":{\"bytes_hex\":\"%08X\",\"planes\":[%u,%u,%u,%u]},"
+        "\"registers\":{",
+        id, (unsigned)planeSizeBytes, (unsigned)vga.latch.d,
+        (unsigned)vga.latch.b[0], (unsigned)vga.latch.b[1],
+        (unsigned)vga.latch.b[2], (unsigned)vga.latch.b[3]);
+
+    std::string result;
+    result.reserve(strlen(head) + regions.size() * 64);
+    result += head;
+
+    char seqBuf[256];
+    snprintf(seqBuf, sizeof(seqBuf),
+        "\"sequencer\":{\"index\":%u,\"reset\":%u,\"clocking_mode\":%u,\"map_mask\":%u,"
+        "\"character_map_select\":%u,\"memory_mode\":%u},",
+        (unsigned)vga.seq.index, (unsigned)vga.seq.reset, (unsigned)vga.seq.clocking_mode,
+        (unsigned)vga.seq.map_mask, (unsigned)vga.seq.character_map_select,
+        (unsigned)vga.seq.memory_mode);
+    result += seqBuf;
+
+    char gfxBuf[384];
+    snprintf(gfxBuf, sizeof(gfxBuf),
+        "\"graphics_controller\":{\"index\":%u,\"set_reset\":%u,\"enable_set_reset\":%u,"
+        "\"color_compare\":%u,\"data_rotate\":%u,\"read_map_select\":%u,\"mode\":%u,"
+        "\"miscellaneous\":%u,\"color_dont_care\":%u,\"bit_mask\":%u},",
+        (unsigned)vga.gfx.index, (unsigned)vga.gfx.set_reset, (unsigned)vga.gfx.enable_set_reset,
+        (unsigned)vga.gfx.color_compare, (unsigned)vga.gfx.data_rotate, (unsigned)vga.gfx.read_map_select,
+        (unsigned)vga.gfx.mode, (unsigned)vga.gfx.miscellaneous, (unsigned)vga.gfx.color_dont_care,
+        (unsigned)vga.gfx.bit_mask);
+    result += gfxBuf;
+
+    char crtcBuf[768];
+    snprintf(crtcBuf, sizeof(crtcBuf),
+        "\"crtc\":{\"index\":%u,\"horizontal_total\":%u,\"horizontal_display_end\":%u,"
+        "\"start_horizontal_blanking\":%u,\"end_horizontal_blanking\":%u,"
+        "\"start_horizontal_retrace\":%u,\"end_horizontal_retrace\":%u,\"vertical_total\":%u,"
+        "\"overflow\":%u,\"preset_row_scan\":%u,\"maximum_scan_line\":%u,\"cursor_start\":%u,"
+        "\"cursor_end\":%u,\"start_address_high\":%u,\"start_address_low\":%u,"
+        "\"cursor_location_high\":%u,\"cursor_location_low\":%u,\"vertical_retrace_start\":%u,"
+        "\"vertical_retrace_end\":%u,\"vertical_display_end\":%u,\"offset\":%u,"
+        "\"underline_location\":%u,\"start_vertical_blanking\":%u,\"end_vertical_blanking\":%u,"
+        "\"mode_control\":%u,\"line_compare\":%u}},",
+        (unsigned)vga.crtc.index, (unsigned)vga.crtc.horizontal_total, (unsigned)vga.crtc.horizontal_display_end,
+        (unsigned)vga.crtc.start_horizontal_blanking, (unsigned)vga.crtc.end_horizontal_blanking,
+        (unsigned)vga.crtc.start_horizontal_retrace, (unsigned)vga.crtc.end_horizontal_retrace,
+        (unsigned)vga.crtc.vertical_total, (unsigned)vga.crtc.overflow, (unsigned)vga.crtc.preset_row_scan,
+        (unsigned)vga.crtc.maximum_scan_line, (unsigned)vga.crtc.cursor_start, (unsigned)vga.crtc.cursor_end,
+        (unsigned)vga.crtc.start_address_high, (unsigned)vga.crtc.start_address_low,
+        (unsigned)vga.crtc.cursor_location_high, (unsigned)vga.crtc.cursor_location_low,
+        (unsigned)vga.crtc.vertical_retrace_start, (unsigned)vga.crtc.vertical_retrace_end,
+        (unsigned)vga.crtc.vertical_display_end, (unsigned)vga.crtc.offset, (unsigned)vga.crtc.underline_location,
+        (unsigned)vga.crtc.start_vertical_blanking, (unsigned)vga.crtc.end_vertical_blanking,
+        (unsigned)vga.crtc.mode_control, (unsigned)vga.crtc.line_compare);
+    result += crtcBuf;
+
+    result += "\"regions\":[";
+    std::vector<uint8_t> scratch;
+    for (size_t r = 0; r < regions.size(); r++) {
+        const VgaSnapshotRegion &reg = regions[r];
+
+        uint32_t available = (reg.offset < planeSizeBytes) ? (planeSizeBytes - reg.offset) : 0;
+        uint32_t returned = std::min<uint32_t>(reg.length, available);
+
+        scratch.resize(returned);
+        for (uint32_t k = 0; k < returned; k++)
+            scratch[k] = vga.mem.linear[(uint32_t)(reg.offset + k) * 4u + reg.plane];
+
+        char regHead[192];
+        snprintf(regHead, sizeof(regHead),
+            "%s{\"plane\":%u,\"offset\":\"%X\",\"requested_length\":%u,\"returned_length\":%u,\"bytes_base64\":\"",
+            r ? "," : "", (unsigned)reg.plane, (unsigned)reg.offset, (unsigned)reg.length, (unsigned)returned);
+        result += regHead;
+        result += Base64Encode(scratch.data(), scratch.size());
+        result += "\"}";
+    }
+    result += "]}}";
+
+    return result;
+}
+
 static std::string ExecCodeDisassemble(long long id, uint16_t seg, uint32_t off, long long count) {
     std::string arr = "[";
     uint32_t curOff = off;
@@ -2354,6 +2488,7 @@ static std::string ExecuteRequest(const AIRequestItem &item) {
         case AIMethod::MouseCaptureGet:   return ExecMouseCaptureGet(item.id);
         case AIMethod::MouseCaptureSet:   return ExecMouseCaptureSet(item.id, item.mouseCaptureDesired);
         case AIMethod::TraceConfigure:    return ApplyTraceConfigure(item.id, item.traceConfig);
+        case AIMethod::VgaSnapshot:       return ExecVgaSnapshot(item.id, item.vgaRegions);
     }
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"id\":%lld,\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"unhandled method\"}}", item.id);
@@ -2743,6 +2878,61 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
         item.ioPort = (uint16_t)port;
         item.ioValue = (uint32_t)strtoul(valStr.c_str(), nullptr, 16);
         item.ioWidth = width;
+    } else if (method == "vga.snapshot") {
+        item.method = AIMethod::VgaSnapshot;
+        if (!params) { RespondError("INVALID_PARAMETER", "vga.snapshot requires \"params\""); return; }
+        auto itRegions = params->object.find("regions");
+        if (itRegions == params->object.end() || itRegions->second.type != JsonValue::Type::Array) {
+            RespondError("INVALID_PARAMETER", "params.regions must be an array"); return;
+        }
+        const std::vector<JsonValue> &arr = itRegions->second.array;
+        if (arr.empty() || arr.size() > MAX_VGA_SNAPSHOT_REGIONS) {
+            RespondError("INVALID_PARAMETER",
+                "params.regions must have 1-" + std::to_string(MAX_VGA_SNAPSHOT_REGIONS) + " entries");
+            return;
+        }
+
+        std::vector<VgaSnapshotRegion> regions;
+        regions.reserve(arr.size());
+        for (size_t r = 0; r < arr.size(); r++) {
+            if (arr[r].type != JsonValue::Type::Object) {
+                RespondError("INVALID_PARAMETER", "params.regions entries must be objects"); return;
+            }
+            auto itPlane  = arr[r].object.find("plane");
+            auto itOffset = arr[r].object.find("offset");
+            auto itLength = arr[r].object.find("length");
+            if (itPlane == arr[r].object.end() || itPlane->second.type != JsonValue::Type::Number ||
+                itPlane->second.number < 0 || itPlane->second.number > 3 ||
+                itPlane->second.number != (double)(int)itPlane->second.number) {
+                RespondError("INVALID_PARAMETER", "params.regions[].plane must be an integer 0-3"); return;
+            }
+            if (itOffset == arr[r].object.end() || itOffset->second.type != JsonValue::Type::String) {
+                RespondError("INVALID_PARAMETER", "params.regions[].offset must be a hex string"); return;
+            }
+            const std::string &offStr = itOffset->second.str;
+            if (offStr.empty() || offStr.size() > 8) {
+                RespondError("INVALID_PARAMETER", "params.regions[].offset must be 1-8 hex digits"); return;
+            }
+            for (char c : offStr) {
+                if (!isxdigit((unsigned char)c)) {
+                    RespondError("INVALID_PARAMETER", "params.regions[].offset must be a hex string"); return;
+                }
+            }
+            if (itLength == arr[r].object.end() || itLength->second.type != JsonValue::Type::Number ||
+                itLength->second.number <= 0 || itLength->second.number > (double)MAX_READ_LENGTH) {
+                RespondError("INVALID_PARAMETER",
+                    "params.regions[].length must be a positive integer up to " + std::to_string(MAX_READ_LENGTH));
+                return;
+            }
+
+            VgaSnapshotRegion region;
+            region.plane  = (uint8_t)itPlane->second.number;
+            region.offset = (uint32_t)strtoul(offStr.c_str(), nullptr, 16);
+            region.length = (uint32_t)itLength->second.number;
+            regions.push_back(region);
+        }
+
+        item.vgaRegions = std::move(regions);
     } else if (method == "breakpoint.set") {
         item.method = AIMethod::BreakpointSet;
         if (!params) { RespondError("INVALID_PARAMETER", "breakpoint.set requires \"params\""); return; }
