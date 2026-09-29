@@ -85,6 +85,12 @@ typedef socklen_t ai_socklen_t;
  * which this headless bridge has no need of. */
 extern uint64_t GetAddress(uint16_t seg, uint32_t offset);
 extern Bitu DasmI386(char* buffer, PhysPt pc, uint32_t cur_ip, bool bit32);
+/* Phase 8E: see the save/restore around Mouse_CursorMoved() below in the
+ * MouseMoveAbsolute/MouseClickAt case -- src/gui/sdlmain.cpp's own real
+ * mouse-motion handler is the ONLY place this normally gets refreshed
+ * (from the SDL motion event's sdl.mouse.locked at the time), which the
+ * AI bridge's synthetic writes never trigger. */
+extern bool user_cursor_locked;
 /* Phase 4D: repaints the curses debugger console (declared in
  * include/debug.h, defined in debug.cpp). Called after an
  * execution.step_over() that took the async call/int/loop/rep path
@@ -1150,8 +1156,57 @@ void DEBUG_AI_CheckPendingInput(void) {
                  * next queued item (if any) can run -- nothing else touches
                  * the emulator thread between them, satisfying the
                  * requirements draft's "same emulator-thread dispatch"
-                 * requirement (section 4.1) without a new lock. */
+                 * requirement (section 4.1) without a new lock.
+                 *
+                 * Phase 8F: that branch ends with a second, later check --
+                 * "if (!emu) { mouse.x = <host cursor proxy> * ...; }" --
+                 * that OVERWRITES whatever was just written above whenever
+                 * user_cursor_locked is false (under the default
+                 * mouse_emulation=locked). user_cursor_locked is normally
+                 * kept in sync with real host mouse capture, but ONLY by
+                 * sdlmain.cpp's real SDL mouse-motion event handler -- which
+                 * the AI bridge's synthetic writes never trigger, so it
+                 * silently stays at its process-start default (false)
+                 * forever, no matter how many times set_mouse_capture(true)
+                 * is called. Confirmed live: an isolated test program
+                 * looping INT 33h AH=03h read back the SAME fixed,
+                 * unrelated position on every poll regardless of what
+                 * move_mouse_absolute()/click_at() sent, with or without
+                 * capture. Forcing it true for just this one call (and
+                 * restoring it immediately after) makes this absolute
+                 * write authoritative every time, matching the documented
+                 * "does not require mouse capture to be on" behavior,
+                 * without permanently altering a flag three other files
+                 * (bios.cpp, serialmouse.cpp, keyboard.cpp) also read for
+                 * unrelated purposes. */
+                bool savedUserCursorLocked = user_cursor_locked;
+                user_cursor_locked = true;
                 Mouse_CursorMoved(0.0f, 0.0f, (float)normX, (float)normY, false);
+                user_cursor_locked = savedUserCursorLocked;
+
+                /* Phase 8E: this absolute write alone only ever updates
+                 * mouse.x/y (INT 33h AH=03h, "get position"). A guest that
+                 * instead reads mouse.mickey_x/y (AH=0Bh, "read motion
+                 * counters") would perceive no movement at all no matter
+                 * what position is written -- confirmed live against a
+                 * real game whose on-screen cursor sprite never moved
+                 * across repeated move_mouse_absolute()/click_at() calls
+                 * to visibly different positions, even with the mouse
+                 * captured. Fed by g_lastGuestX/Y (already tracked below,
+                 * for last_guest_x/y) rather than g_hasLastGuestXY being
+                 * required for correctness elsewhere -- the first-ever
+                 * call in a session has no prior position to diff against,
+                 * so no mickey delta is generated for it (matching how a
+                 * real mouse cannot report motion before its first
+                 * sample either). See mouse.h's Mouse_AddNormalizedMickeys
+                 * for why this is a dedicated function rather than passing
+                 * a real xrel/yrel into Mouse_CursorMoved() above. */
+                if (g_hasLastGuestXY && guestW > 1 && guestH > 1) {
+                    double prevNormX = (double)g_lastGuestX / (double)(guestW - 1);
+                    double prevNormY = (double)g_lastGuestY / (double)(guestH - 1);
+                    Mouse_AddNormalizedMickeys((float)(normX - prevNormX), (float)(normY - prevNormY));
+                }
+
                 g_lastGuestX = guestX;
                 g_lastGuestY = guestY;
                 g_hasLastGuestXY = true;

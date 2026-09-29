@@ -58,6 +58,33 @@ void Mouse_AfterNewVideoMode(bool setmode);
  * mouse.cpp and otherwise unreachable from debug_ai.cpp. */
 bool Mouse_AbsolutePositioningAvailable(void);
 
+/* DOSBox-X-AI project (Phase 8E, src/debug/debug_ai.cpp): an AI-bridge
+ * absolute mouse write (move_mouse_absolute()/click_at()) only ever calls
+ * Mouse_CursorMoved(xrel=0, yrel=0, ...) -- it updates mouse.x/mouse.y
+ * (read by INT 33h AH=03h, "get position") but never mouse.mickey_x/y
+ * (read by AH=0Bh, "read motion counters"), since those are only ever
+ * accumulated from a REAL xrel/yrel delta. A guest driven by mickeys
+ * therefore never perceives any movement no matter what absolute
+ * position the bridge writes. This adds the missing piece: given the
+ * CHANGE in normalized ([0,1]) position between two absolute writes
+ * (computed by the caller from its own last-dispatched position), scale
+ * it by the driver's own mouse.max_x/max_y (not necessarily the same as
+ * the render-doubled guest_pixels scale -- see
+ * docs/phase7b-mouse-capture-and-absolute-input-design.md's Mode 13h
+ * caveat) and accumulate it into mouse.mickey_x/y with the exact same
+ * wraparound clamp Mouse_CursorMoved()'s own mickey accumulation uses.
+ * Deliberately NOT folded into Mouse_CursorMoved() itself: that function
+ * is also the real host-mouse "seamless integration" path (emulate=false
+ * with genuine host cursor input), and its own mickey accumulation is
+ * gated on user_cursor_locked -- a host-capture concept that has no
+ * bearing on a synthetic AI-bridge write, which should always be able to
+ * generate a consistent mickey delta regardless of host capture state.
+ * (Mouse_Read_Motion_Data() still reports zero motion to the guest
+ * unless MOUSE_IsLocked() is true, per existing DOSBox-X behavior --
+ * this function cannot and does not change that; a caller targeting a
+ * mickey-reading guest must still call set_mouse_capture(true) first.) */
+void Mouse_AddNormalizedMickeys(float normDx, float normDy);
+
 void UpdateMouseReportRate(void);
 void ChangeMouseReportRate(unsigned int new_rate);
 

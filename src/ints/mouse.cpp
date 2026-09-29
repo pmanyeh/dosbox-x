@@ -872,6 +872,26 @@ bool Mouse_AbsolutePositioningAvailable(void) {
     return mouse.max_x > 0 && mouse.max_y > 0;
 }
 
+/* See mouse.h for why this exists (Phase 8E, DOSBox-X-AI project). Scales
+ * a normalized position delta by the driver's own mouse.max_x/max_y (the
+ * SAME values Mouse_CursorMoved()'s absolute branch above scales x/y by)
+ * and accumulates it into mouse.mickey_x/y, using the identical
+ * wraparound clamp Mouse_CursorMoved()'s own mickey accumulation uses
+ * just above (lines ~911-926) so a guest reading motion counters cannot
+ * tell the difference from genuine relative motion that happened to add
+ * up to the same delta. A no-op if the driver has no valid range yet. */
+void Mouse_AddNormalizedMickeys(float normDx, float normDy) {
+    if (mouse.max_x <= 0 || mouse.max_y <= 0) return;
+
+    mouse.mickey_x += normDx * (float)mouse.max_x;
+    mouse.mickey_y += normDy * (float)mouse.max_y;
+
+    if (mouse.mickey_x >= 32768) mouse.mickey_x -= 65536;
+    else if (mouse.mickey_x <= -32769) mouse.mickey_x += 65536;
+    if (mouse.mickey_y >= 32768) mouse.mickey_y -= 65536;
+    else if (mouse.mickey_y <= -32769) mouse.mickey_y += 65536;
+}
+
 #if C_DEBUG
 bool IsDebuggerActive(void);
 #endif
