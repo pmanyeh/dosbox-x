@@ -67,6 +67,15 @@ void DEBUG_AI_CheckPendingInput(void);
 void DEBUG_AI_CheckPendingFrameCapture(Bitu width, Bitu height, Bitu bpp, Bitu pitch,
     Bitu flags, const uint8_t *data, const uint8_t *pal);
 
+/* Phase 9A (DOSBox-X-AI project, src/debug/debug_ai.cpp): arms pending
+ * video.composite.capture requests against THIS frame (the one about to
+ * be presented), recording its geometry and -- for include_source -- the
+ * same pre-scaler image video.frame.capture would return. Called from
+ * RENDER_EndUpdate() only when PRESENT_Composite_WantsFullFrame() is true
+ * and the frame will reach GFX_EndUpdate(). See include/present_hook.h. */
+void DEBUG_AI_ArmCompositeCapture(Bitu width, Bitu height, Bitu bpp, Bitu pitch,
+    Bitu flags, const uint8_t *data, const uint8_t *pal);
+
 /* Phase 7E (DOSBox-X-AI project, src/debug/debug_ai.cpp): DOS file I/O
  * event log. Declared again here (as well as in debug_ai.h) so dos.cpp
  * -- which does not otherwise depend on src/debug/ -- can call these

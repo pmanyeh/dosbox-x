@@ -1419,6 +1419,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\libs\mt32\Partial.cpp" />
     <ClCompile Include="..\src\libs\mt32\PartialManager.cpp" />
     <ClCompile Include="..\src\libs\mt32\Poly.cpp" />
+    <ClCompile Include="..\src\gui\present_hook.cpp" />
     <ClCompile Include="..\src\gui\render.cpp" />
     <ClCompile Include="..\src\gui\render_scalers.cpp" />
     <ClCompile Include="..\src\aviwriter\riff.cpp" />

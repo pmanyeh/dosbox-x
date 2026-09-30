@@ -31,6 +31,7 @@ extern Bitu currentWindowWidth, currentWindowHeight;
 
 #include "direct3d.h"
 #include "render.h" // IMPLEMENTED
+#include "present_hook.h"
 #include <sstream>
 
 #if LOG_D3D && D3D_THREAD
@@ -319,19 +320,24 @@ bool CDirect3D::UnlockTexture(const uint16_t *changed)
 	changedLines = changed;
 #if D3D_THREAD
 	Wait(false);
+	presentRenderSeq = PRESENT_GetRenderSeq();
 	thread_command = D3D_UNLOCK;
 	LeaveCriticalSection(&cs);
 
 	SDL_SemPost(thread_sem);
 	return true;
 #else
+	presentRenderSeq = PRESENT_GetRenderSeq();
 	return UnlockTexture();
 #endif
 }
 
 bool CDirect3D::UnlockTexture(void)
 {
-    if(GCC_UNLIKELY(deviceLost)) return false;
+    if(GCC_UNLIKELY(deviceLost)) {
+        if(GCC_UNLIKELY(PRESENT_Hook_Armed())) PRESENT_Hook_NoteDeviceLost();
+        return false;
+    }
     // Support EndUpdate without new data...needed by some shaders
     if(GCC_UNLIKELY(!d3dlr.pBits)) return D3DSwapBuffers();
     lpTexture->UnlockRect(0);
@@ -705,6 +711,116 @@ void CDirect3D::UpdateRectToSDLSurface(int x,int y,int w,int h) {
 	SAFE_RELEASE(tsurf);
 }
 
+// Phase 9A (DOSBox-X-AI): read a rectangle of the current back buffer into
+// tightly packed RGBA8888 for video.composite.capture. Runs on whichever
+// thread calls D3DSwapBuffers() (the D3D worker thread when D3D_THREAD).
+// The system-memory copy surface is cached and only recreated when the
+// back buffer's size or format changes.
+bool CDirect3D::ReadBackBufferRGBA8888(int x, int y, int w, int h, std::vector<uint8_t> &out,
+				       std::string &errCode, std::string &errMsg)
+{
+    if(!pD3DDevice9) {
+	errCode = "INTERNAL_ERROR"; errMsg = "no Direct3D device";
+	return false;
+    }
+
+    IDirect3DSurface9 *bbsurf = NULL;
+    if(FAILED(pD3DDevice9->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bbsurf))) {
+	errCode = "INTERNAL_ERROR"; errMsg = "GetBackBuffer failed";
+	return false;
+    }
+
+    D3DSURFACE_DESC desc;
+    if(FAILED(bbsurf->GetDesc(&desc))) {
+	SAFE_RELEASE(bbsurf);
+	errCode = "INTERNAL_ERROR"; errMsg = "back buffer GetDesc failed";
+	return false;
+    }
+    if(x < 0 || y < 0 || w <= 0 || h <= 0 || (UINT)(x + w) > desc.Width || (UINT)(y + h) > desc.Height) {
+	SAFE_RELEASE(bbsurf);
+	errCode = "CROP_OUT_OF_BOUNDS"; errMsg = "readback rectangle outside the back buffer";
+	return false;
+    }
+    if(desc.MultiSampleType != D3DMULTISAMPLE_NONE) {
+	SAFE_RELEASE(bbsurf);
+	errCode = "COMPOSITE_UNSUPPORTED_FORMAT"; errMsg = "multisampled back buffer";
+	return false;
+    }
+    switch(desc.Format) {
+	case D3DFMT_X8R8G8B8: case D3DFMT_A8R8G8B8:
+	case D3DFMT_R5G6B5: case D3DFMT_X1R5G5B5: case D3DFMT_A1R5G5B5:
+	    break;
+	default: {
+	    SAFE_RELEASE(bbsurf);
+	    char buf[64];
+	    snprintf(buf, sizeof(buf), "back buffer format %u is not supported", (unsigned int)desc.Format);
+	    errCode = "COMPOSITE_UNSUPPORTED_FORMAT"; errMsg = buf;
+	    return false;
+	}
+    }
+
+    if(captureSurface) {
+	D3DSURFACE_DESC cdesc;
+	if(FAILED(captureSurface->GetDesc(&cdesc)) || cdesc.Width != desc.Width ||
+	   cdesc.Height != desc.Height || cdesc.Format != desc.Format)
+	    SAFE_RELEASE(captureSurface);
+    }
+    if(!captureSurface &&
+       FAILED(pD3DDevice9->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format,
+							D3DPOOL_SYSTEMMEM, &captureSurface, NULL))) {
+	captureSurface = NULL;
+	SAFE_RELEASE(bbsurf);
+	errCode = "INTERNAL_ERROR"; errMsg = "CreateOffscreenPlainSurface failed";
+	return false;
+    }
+
+    HRESULT hr = pD3DDevice9->GetRenderTargetData(bbsurf, captureSurface);
+    SAFE_RELEASE(bbsurf);
+    if(FAILED(hr)) {
+	errCode = "INTERNAL_ERROR"; errMsg = "GetRenderTargetData failed";
+	return false;
+    }
+
+    D3DLOCKED_RECT rl;
+    if(FAILED(captureSurface->LockRect(&rl, NULL, D3DLOCK_READONLY))) {
+	errCode = "INTERNAL_ERROR"; errMsg = "LockRect on the capture surface failed";
+	return false;
+    }
+
+    out.resize((size_t)w * (size_t)h * 4);
+    for(int row = 0; row < h; row++) {
+	const uint8_t *src = (const uint8_t*)rl.pBits + (size_t)(y + row) * rl.Pitch;
+	uint8_t *dst = out.data() + (size_t)row * (size_t)w * 4;
+	for(int col = 0; col < w; col++, dst += 4) {
+	    switch(desc.Format) {
+		case D3DFMT_X8R8G8B8:
+		case D3DFMT_A8R8G8B8: {
+		    const uint8_t *p = src + (size_t)(x + col) * 4; // B,G,R,X
+		    dst[0] = p[2]; dst[1] = p[1]; dst[2] = p[0];
+		    break;
+		}
+		case D3DFMT_R5G6B5: {
+		    uint16_t v = ((const uint16_t*)src)[x + col];
+		    dst[0] = (uint8_t)(((v & 0xf800u) * 0x21u) >> 13);
+		    dst[1] = (uint8_t)(((v & 0x07e0u) * 0x41u) >> 9);
+		    dst[2] = (uint8_t)(((v & 0x001fu) * 0x21u) >> 2);
+		    break;
+		}
+		default: { // X1R5G5B5 / A1R5G5B5
+		    uint16_t v = ((const uint16_t*)src)[x + col];
+		    dst[0] = (uint8_t)(((v & 0x7c00u) * 0x21u) >> 12);
+		    dst[1] = (uint8_t)(((v & 0x03e0u) * 0x21u) >> 7);
+		    dst[2] = (uint8_t)(((v & 0x001fu) * 0x21u) >> 2);
+		    break;
+		}
+	    }
+	    dst[3] = 0xFF;
+	}
+    }
+    captureSurface->UnlockRect();
+    return true;
+}
+
 // Draw a textured quad on the back-buffer
 bool CDirect3D::D3DSwapBuffers(void)
 {
@@ -861,6 +977,35 @@ pass2:
     // end rendering
     pD3DDevice9->EndScene();
 
+    // Phase 9A (DOSBox-X-AI): the back buffer now holds the final composed
+    // frame (all shader passes done). SwapEffect is DISCARD, so this is the
+    // last point it can be read back. Idle cost: one relaxed atomic load.
+    if(GCC_UNLIKELY(PRESENT_Hook_Armed())) {
+	struct D3DReadback : IPresentReadback {
+	    CDirect3D *self;
+	    explicit D3DReadback(CDirect3D *s) : self(s) {}
+	    bool ReadRGBA8888(int x, int y, int w, int h, std::vector<uint8_t> &out,
+			      std::string &errCode, std::string &errMsg) override {
+		return self->ReadBackBufferRGBA8888(x, y, w, h, out, errCode, errMsg);
+	    }
+	} rb(this);
+	PresentContext ctx;
+	ctx.backend = "direct3d";
+	ctx.render_seq = presentRenderSeq;
+	ctx.bb_width = d3dpp.BackBufferWidth;
+	ctx.bb_height = d3dpp.BackBufferHeight;
+	ctx.clip_x = (int32_t)dwX;
+	ctx.clip_y = (int32_t)dwY;
+	ctx.clip_w = (int32_t)dwScaledWidth;
+	ctx.clip_h = (int32_t)dwScaledHeight;
+	ctx.draw_width = dwWidth;
+	ctx.draw_height = dwHeight;
+#if C_D3DSHADERS
+	if(psEffect && psActive && !pshader.empty()) ctx.pixel_shader = pshader;
+#endif
+	PRESENT_Hook_BeforePresent(ctx, rb);
+    }
+
     if(GCC_UNLIKELY(hr=pD3DDevice9->Present(NULL, NULL, NULL, NULL)) != D3D_OK) {
 	switch(hr) {
 	    case D3DERR_DEVICELOST:
@@ -889,6 +1034,7 @@ pass2:
 
 HRESULT CDirect3D::InvalidateDeviceObjects(void)
 {
+    SAFE_RELEASE(captureSurface);
     SAFE_RELEASE(lpTexture);
 #if C_D3DSHADERS
     SAFE_RELEASE(lpWorkTexture1);

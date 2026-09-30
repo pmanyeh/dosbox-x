@@ -366,6 +366,9 @@
     <ClCompile Include="..\src\gui\midi.cpp">
       <Filter>Sources\gui</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\gui\present_hook.cpp">
+      <Filter>Sources\gui</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\gui\render.cpp">
       <Filter>Sources\gui</Filter>
     </ClCompile>

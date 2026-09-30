@@ -8,6 +8,7 @@
 #include "sdlmain.h"
 #include "render.h"
 #include "vga.h"
+#include "present_hook.h"
 
 #include <output/output_tools.h>
 #include <output/output_tools_xbrz.h>
@@ -640,7 +641,84 @@ bool OUTPUT_SURFACE_StartUpdate(uint8_t* &pixels, Bitu &pitch)
     return true;
 }
 
+static void OUTPUT_SURFACE_EndUpdate_Present(const uint16_t *changedLines);
+
+/* Phase 9A (DOSBox-X-AI): reads sdl.surface -- the exact image the surface
+ * backend presents -- into RGBA8888 for video.composite.capture. */
+namespace {
+struct SurfaceReadback : IPresentReadback {
+    bool ReadRGBA8888(int x, int y, int w, int h, std::vector<uint8_t> &out,
+                      std::string &errCode, std::string &errMsg) override {
+        SDL_Surface *surf = sdl.surface;
+        if (!surf) { errCode = "INTERNAL_ERROR"; errMsg = "no SDL surface"; return false; }
+        if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > surf->w || y + h > surf->h) {
+            errCode = "CROP_OUT_OF_BOUNDS"; errMsg = "readback rectangle outside the surface";
+            return false;
+        }
+        SDL_PixelFormat *fmt = surf->format;
+        const int bytesPP = fmt->BytesPerPixel;
+        if (bytesPP < 1 || bytesPP > 4) {
+            errCode = "COMPOSITE_UNSUPPORTED_FORMAT"; errMsg = "unsupported surface pixel size";
+            return false;
+        }
+        const bool mustLock = SDL_MUSTLOCK(surf);
+        if (mustLock && SDL_LockSurface(surf) != 0) {
+            errCode = "INTERNAL_ERROR"; errMsg = "SDL_LockSurface failed";
+            return false;
+        }
+        if (!surf->pixels) {
+            if (mustLock) SDL_UnlockSurface(surf);
+            errCode = "INTERNAL_ERROR"; errMsg = "SDL surface has no pixels";
+            return false;
+        }
+        out.resize((size_t)w * (size_t)h * 4);
+        for (int row = 0; row < h; row++) {
+            const uint8_t *src = (const uint8_t*)surf->pixels + (size_t)(y + row) * surf->pitch + (size_t)x * bytesPP;
+            uint8_t *dst = out.data() + (size_t)row * (size_t)w * 4;
+            for (int col = 0; col < w; col++, src += bytesPP, dst += 4) {
+                uint32_t pixel;
+                switch (bytesPP) {
+                    case 1: pixel = src[0]; break;
+                    case 2: pixel = *(const uint16_t*)src; break;
+                    case 3: pixel = (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16); break;
+                    default: pixel = *(const uint32_t*)src; break;
+                }
+                SDL_GetRGB(pixel, fmt, &dst[0], &dst[1], &dst[2]);
+                dst[3] = 0xFF;
+            }
+        }
+        if (mustLock) SDL_UnlockSurface(surf);
+        return true;
+    }
+};
+}
+
 void OUTPUT_SURFACE_EndUpdate(const uint16_t *changedLines)
+{
+    OUTPUT_SURFACE_EndUpdate_Present(changedLines);
+
+    /* Unlike D3D9 (SwapEffect DISCARD), sdl.surface keeps its contents
+     * after being presented, so reading it here -- after every branch of
+     * the present routine, including its early returns -- sees exactly
+     * the image that was just shown. Idle cost: one relaxed atomic load. */
+    if (GCC_UNLIKELY(PRESENT_Hook_Armed()) && sdl.surface) {
+        PresentContext ctx;
+        ctx.backend = "surface";
+        ctx.render_seq = PRESENT_GetRenderSeq();
+        ctx.bb_width = (uint32_t)sdl.surface->w;
+        ctx.bb_height = (uint32_t)sdl.surface->h;
+        ctx.clip_x = sdl.clip.x;
+        ctx.clip_y = sdl.clip.y;
+        ctx.clip_w = sdl.clip.w;
+        ctx.clip_h = sdl.clip.h;
+        ctx.draw_width = (uint32_t)sdl.draw.width;
+        ctx.draw_height = (uint32_t)sdl.draw.height;
+        SurfaceReadback rb;
+        PRESENT_Hook_BeforePresent(ctx, rb);
+    }
+}
+
+static void OUTPUT_SURFACE_EndUpdate_Present(const uint16_t *changedLines)
 {
 #if DOSBOXMENU_TYPE == DOSBOXMENU_SDLDRAW
     GFX_DrawSDLMenu(mainMenu, mainMenu.display_list);

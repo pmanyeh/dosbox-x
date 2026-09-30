@@ -29,6 +29,7 @@ parport.h \
 paging.h \
 pci_bus.h \
 pic.h \
+present_hook.h \
 programs.h \
 qcow2_disk.h \
 render.h \

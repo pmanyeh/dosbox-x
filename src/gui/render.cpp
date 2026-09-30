@@ -38,6 +38,7 @@
 #include "hardware.h"
 #include "support.h"
 #include "sdlmain.h"
+#include "present_hook.h"
 #include "shell.h"
 #include "pc98_cg.h"
 #include "pc98_gdc.h"
@@ -422,7 +423,12 @@ bool RENDER_StartUpdate(void) {
     render.scale.outPitch = 0;
     Scaler_ChangedLines[0] = 0;
     Scaler_ChangedLineIndex = 0;
-    if (GCC_UNLIKELY( render.scale.clearCache) ) {
+    /* Phase 9A (DOSBox-X-AI): while a video.composite.capture request is
+     * waiting to be armed, take the same full-redraw path a cache clear
+     * uses, so the next frame is handed to the backend and presented even
+     * if the guest screen is static (see include/present_hook.h). This
+     * does not touch render.forceUpdate or render.scale.clearCache. */
+    if (GCC_UNLIKELY( render.scale.clearCache || PRESENT_Composite_WantsFullFrame()) ) {
 //      LOG_MSG("Clearing cache");
         //Will always have to update the screen with this one anyway, so let's update already
         if (GCC_UNLIKELY(!GFX_StartUpdate( render.scale.outWrite, render.scale.outPitch )))
@@ -478,6 +484,10 @@ void RENDER_EndUpdate( bool abort ) {
     if (GCC_UNLIKELY(!render.updating))
         return;
 
+    /* Phase 9A (DOSBox-X-AI): every frame gets a sequence number so a
+     * composite capture can tell which present belongs to which frame. */
+    PRESENT_OnRenderEndUpdate();
+
     if (video_debug_overlay && !abort && render.active && render.scale.outLine != 0)
         VGA_DebugOverlay();
 
@@ -528,6 +538,14 @@ void RENDER_EndUpdate( bool abort ) {
             DEBUG_AI_CheckPendingFrameCapture(render.src.width, render.src.height, render.src.bpp,
                 render.scale.cachePitch, aiFlags, (uint8_t*)scalerSourceCacheBuffer,
                 (uint8_t*)&render.pal.rgb);
+
+            /* Phase 9A: arm pending video.composite.capture requests
+             * against this frame -- only when it will actually reach
+             * GFX_EndUpdate() with pixel data (i.e. be presented). */
+            if (!abort && render.scale.outWrite && PRESENT_Composite_WantsFullFrame())
+                DEBUG_AI_ArmCompositeCapture(render.src.width, render.src.height, render.src.bpp,
+                    render.scale.cachePitch, aiFlags, (uint8_t*)scalerSourceCacheBuffer,
+                    (uint8_t*)&render.pal.rgb);
         }
 #endif
         if ( render.scale.outWrite) {

@@ -53,6 +53,7 @@
 #include "video.h"
 #include "inout.h"
 #include "vga.h"
+#include "present_hook.h"
 
 #if (C_SSHOT)
 #include <zlib.h>
@@ -1407,7 +1408,10 @@ static std::vector<uint8_t> UnpackFrameToRGBA8888(Bitu width, Bitu height, Bitu 
                 }
             }
 
-            uint8_t *dst = dstLine + (size_t)x * 4;
+            /* Phase 9A fix: with DBLW, source pixel x lands at output
+             * pixels 2x and 2x+1 (this used to write x and 2x+1, which
+             * squeezed the frame into the left half of the image). */
+            uint8_t *dst = dstLine + (size_t)x * (dblw ? 8 : 4);
             dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = 0xFF;
 
             if (dblw) {
@@ -1603,6 +1607,245 @@ void DEBUG_AI_CheckPendingFrameCapture(Bitu width, Bitu height, Bitu bpp, Bitu p
             req.conn->cv.notify_all();
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Composite capture (Phase 9A)                                        */
+/*                                                                      */
+/* video.composite.capture returns the backend's FINAL composed back    */
+/* buffer -- after scaling, filtering, pixel shaders and letterboxing,  */
+/* immediately before it is presented -- plus the geometry needed to    */
+/* map guest coordinates onto it. The backend-agnostic plumbing (request */
+/* queue, render_seq, arming, readback at present) lives in              */
+/* src/gui/present_hook.cpp; this section only arms requests with the    */
+/* emulator-side geometry (and optional source frame) and, on the socket */
+/* thread, crops/scales/encodes the result. See                          */
+/* docs/phase9a-composite-capture-design.md.                             */
+/* ------------------------------------------------------------------ */
+
+/* The guest mode's own pixel grid, e.g. 320x200 for mode 13h -- which
+ * reaches the renderer as 320x400 (CRTC scanline doubling kept as real
+ * lines) and is then pixel-doubled horizontally by RENDER_SetSize()'s
+ * dblw. Horizontal doubling is undone by using render.src.width as-is;
+ * vertical scanline doubling is undone here using the same CRTC-derived
+ * state VGA_SetupDrawing() used to produce it. */
+static void ResolveGuestNativeSize(uint32_t &outW, uint32_t &outH) {
+    uint32_t w = (uint32_t)render.src.width;
+    uint32_t h = (uint32_t)render.src.height;
+    if (IS_EGAVGA_ARCH && vga.mode != M_TEXT && vga.draw.doublescan_effect &&
+        vga.draw.address_line_total > 1 && h % vga.draw.address_line_total == 0)
+        h /= (uint32_t)vga.draw.address_line_total;
+    outW = w;
+    outH = h;
+}
+
+void DEBUG_AI_ArmCompositeCapture(Bitu width, Bitu height, Bitu bpp, Bitu pitch,
+        Bitu flags, const uint8_t *data, const uint8_t *pal) {
+    CompositeArmInfo info;
+    info.emulated_ms = (uint64_t)PIC_FullIndex();
+    /* Same size video.frame.capture reports (dblw/dblh only when unequal). */
+    info.render_src_w = (uint32_t)(width * ((flags & CAPTURE_FLAG_DBLW) ? 2 : 1));
+    info.render_src_h = (uint32_t)(height * ((flags & CAPTURE_FLAG_DBLH) ? 2 : 1));
+    ResolveGuestNativeSize(info.guest_native_w, info.guest_native_h);
+    info.aspect_correction = render.aspect != 0;
+
+    PRESENT_Composite_Arm(info, [&](std::vector<uint8_t> &out, uint32_t &w, uint32_t &h) {
+        if (!data || !width || !height) return false;
+        Bitu ow = 0, oh = 0;
+        out = UnpackFrameToRGBA8888(width, height, bpp, pitch, flags, data, pal, ow, oh);
+        w = (uint32_t)ow;
+        h = (uint32_t)oh;
+        return true;
+    });
+}
+
+struct CompositeRect { long long x = 0, y = 0, w = 0, h = 0; };
+
+static bool ParseRectParam(const JsonValue &v, CompositeRect &r) {
+    if (v.type != JsonValue::Type::Object) return false;
+    const char *keys[4] = { "x", "y", "w", "h" };
+    long long *dst[4] = { &r.x, &r.y, &r.w, &r.h };
+    for (int i = 0; i < 4; i++) {
+        auto it = v.object.find(keys[i]);
+        if (it == v.object.end() || it->second.type != JsonValue::Type::Number) return false;
+        double d = it->second.number;
+        if (d != std::floor(d) || d < -1e9 || d > 1e9) return false;
+        *dst[i] = (long long)d;
+    }
+    return true;
+}
+
+static std::string RectJson(long long x, long long y, long long w, long long h) {
+    return "{\"x\":" + std::to_string(x) + ",\"y\":" + std::to_string(y) +
+        ",\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}";
+}
+
+static std::string SizeJson(long long w, long long h) {
+    return "{\"w\":" + std::to_string(w) + ",\"h\":" + std::to_string(h) + "}";
+}
+
+static std::string FloatJson(double v) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.6g", v);
+    return buf;
+}
+
+static std::vector<uint8_t> CropRGBA8888(const std::vector<uint8_t> &src, uint32_t srcW,
+        long long x, long long y, long long w, long long h) {
+    std::vector<uint8_t> out((size_t)w * (size_t)h * 4);
+    for (long long row = 0; row < h; row++)
+        memcpy(out.data() + (size_t)row * (size_t)w * 4,
+               src.data() + ((size_t)(y + row) * srcW + (size_t)x) * 4, (size_t)w * 4);
+    return out;
+}
+
+/* Encodes rgba as PNG (or passes it through for format=rgba) and enforces
+ * the payload cap. On failure returns false with errJson set to a
+ * complete error response line. */
+static bool EncodeCompositeImage(long long id, bool wantPng, const std::vector<uint8_t> &rgba,
+        Bitu w, Bitu h, std::vector<uint8_t> &out, std::string &errJson) {
+#if (C_SSHOT)
+    if (wantPng) {
+        if (!EncodeRGBA8888AsPng(rgba, w, h, out)) {
+            errJson = "{\"id\":" + std::to_string(id) +
+                ",\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"PNG encoding failed\"}}";
+            return false;
+        }
+    } else {
+        out = rgba;
+    }
+#else
+    if (wantPng) {
+        errJson = "{\"id\":" + std::to_string(id) +
+            ",\"ok\":false,\"error\":{\"code\":\"INTERNAL_ERROR\",\"message\":\"this build has no PNG support (C_SSHOT=0); use format=\\\"rgba\\\"\"}}";
+        return false;
+    }
+    out = rgba;
+#endif
+    if (out.size() > MAX_FRAME_PAYLOAD_BYTES) {
+        double scale = std::sqrt((double)MAX_FRAME_PAYLOAD_BYTES / (double)out.size());
+        Bitu suggestedW = std::max<Bitu>(1, (Bitu)((double)w * scale));
+        Bitu suggestedH = std::max<Bitu>(1, (Bitu)((double)h * scale));
+        errJson = "{\"id\":" + std::to_string(id) +
+            ",\"ok\":false,\"error\":{\"code\":\"FRAME_TOO_LARGE\",\"message\":\"encoded image exceeds the " +
+            std::to_string(MAX_FRAME_PAYLOAD_BYTES) + "-byte cap (suggested_max_width=" +
+            std::to_string(suggestedW) + ", suggested_max_height=" + std::to_string(suggestedH) +
+            ")\",\"suggested_max_width\":" +
+            std::to_string(suggestedW) + ",\"suggested_max_height\":" + std::to_string(suggestedH) + "}}";
+        return false;
+    }
+    return true;
+}
+
+struct CompositeCaptureParams {
+    bool wantPng = true;
+    bool cropFull = false;
+    bool haveRect = false, haveGameRect = false;
+    CompositeRect rect, gameRect;
+    uint32_t maxWidth = 0, maxHeight = 0;
+};
+
+/* Runs on the socket thread once the request completed successfully:
+ * crop, optional downscale, encode, and build the full response line.
+ * Keeping this off the present thread is a design requirement (8). */
+static std::string BuildCompositeCaptureResponse(long long id, const CompositeCaptureParams &p,
+        const CompositeRequest &r) {
+    const PresentContext &c = r.ctx;
+    const long long bbW = c.bb_width, bbH = c.bb_height;
+    auto errorLine = [&](const char *code, const std::string &msg) {
+        return "{\"id\":" + std::to_string(id) + ",\"ok\":false,\"error\":{\"code\":\"" + code +
+            "\",\"message\":\"" + JsonEscape(msg) + "\"}}";
+    };
+
+    if (r.rgba.size() != (size_t)bbW * (size_t)bbH * 4)
+        return errorLine("INTERNAL_ERROR", "composite readback size does not match the back buffer");
+
+    long long cx, cy, cw, ch;
+    if (p.haveRect) {
+        cx = p.rect.x; cy = p.rect.y; cw = p.rect.w; ch = p.rect.h;
+    } else if (p.haveGameRect) {
+        const long long gx = p.gameRect.x, gy = p.gameRect.y;
+        const long long gr = gx + p.gameRect.w, gb = gy + p.gameRect.h;
+        if (!r.guest_native_w || !r.guest_native_h)
+            return errorLine("CROP_OUT_OF_BOUNDS", "guest native size is unknown -- no video mode established");
+        if (p.gameRect.w <= 0 || p.gameRect.h <= 0 || gx < 0 || gy < 0 ||
+            gr > (long long)r.guest_native_w || gb > (long long)r.guest_native_h)
+            return errorLine("CROP_OUT_OF_BOUNDS", "game_rect " +
+                RectJson(gx, gy, p.gameRect.w, p.gameRect.h) + " is outside the guest's " +
+                std::to_string(r.guest_native_w) + "x" + std::to_string(r.guest_native_h) + " native grid");
+        /* Design doc 6.1: floor the top-left, ceil the bottom-right. */
+        cx = c.clip_x + (long long)std::floor((double)gx * c.clip_w / r.guest_native_w);
+        cy = c.clip_y + (long long)std::floor((double)gy * c.clip_h / r.guest_native_h);
+        cw = c.clip_x + (long long)std::ceil((double)gr * c.clip_w / r.guest_native_w) - cx;
+        ch = c.clip_y + (long long)std::ceil((double)gb * c.clip_h / r.guest_native_h) - cy;
+    } else if (p.cropFull) {
+        cx = 0; cy = 0; cw = bbW; ch = bbH;
+    } else {
+        cx = c.clip_x; cy = c.clip_y; cw = c.clip_w; ch = c.clip_h;
+    }
+    if (cw <= 0 || ch <= 0 || cx < 0 || cy < 0 || cx + cw > bbW || cy + ch > bbH)
+        return errorLine("CROP_OUT_OF_BOUNDS", "crop rectangle " + RectJson(cx, cy, cw, ch) +
+            " is outside the " + std::to_string(bbW) + "x" + std::to_string(bbH) + " back buffer");
+
+    std::vector<uint8_t> cropped = (cx == 0 && cy == 0 && cw == bbW && ch == bbH)
+        ? r.rgba : CropRGBA8888(r.rgba, c.bb_width, cx, cy, cw, ch);
+    Bitu outW = (Bitu)cw, outH = (Bitu)ch;
+    bool scaled = false;
+    if (p.maxWidth || p.maxHeight) {
+        std::vector<uint8_t> s = ScaleRGBA8888NearestNeighbor(cropped, (Bitu)cw, (Bitu)ch,
+            p.maxWidth, p.maxHeight, outW, outH);
+        scaled = (outW != (Bitu)cw || outH != (Bitu)ch);
+        cropped.swap(s);
+    }
+
+    std::vector<uint8_t> encoded;
+    std::string errJson;
+    if (!EncodeCompositeImage(id, p.wantPng, cropped, outW, outH, encoded, errJson)) return errJson;
+
+    const char *payloadField = p.wantPng ? "png_base64" : "rgba_base64";
+    std::string sourceJson;
+    if (r.include_source) {
+        if (r.source_rgba.empty()) {
+            sourceJson = ",\"source\":null";
+        } else {
+            std::vector<uint8_t> srcEncoded;
+            if (!EncodeCompositeImage(id, p.wantPng, r.source_rgba, r.source_w, r.source_h, srcEncoded, errJson))
+                return errJson;
+            sourceJson = ",\"source\":{\"width\":" + std::to_string(r.source_w) +
+                ",\"height\":" + std::to_string(r.source_h) +
+                ",\"" + payloadField + "\":\"" + Base64Encode(srcEncoded.data(), srcEncoded.size()) + "\"}";
+        }
+    }
+
+    const uint64_t frameId = g_nextFrameId.fetch_add(1);
+    const double scaleX = r.guest_native_w ? (double)c.clip_w / (double)r.guest_native_w : 0.0;
+    const double scaleY = r.guest_native_h ? (double)c.clip_h / (double)r.guest_native_h : 0.0;
+
+    return "{\"id\":" + std::to_string(id) + ",\"ok\":true,\"result\":{"
+        "\"frame_id\":" + std::to_string(frameId) + ","
+        "\"backend\":\"" + JsonEscape(c.backend) + "\","
+        "\"target_render_seq\":" + std::to_string(r.target_render_seq) + ","
+        "\"presented_render_seq\":" + std::to_string(c.render_seq) + ","
+        "\"source_frame_match\":" + (c.render_seq == r.target_render_seq ? "true" : "false") + ","
+        "\"captured_at_emulated_ms\":" + std::to_string(r.captured_at_emulated_ms) + ","
+        "\"layers\":[\"dos_image\"],"
+        "\"width\":" + std::to_string(outW) + ","
+        "\"height\":" + std::to_string(outH) + ","
+        "\"crop_rect\":" + RectJson(cx, cy, cw, ch) + ","
+        "\"scaled\":" + (scaled ? "true" : "false") + ","
+        "\"geometry\":{"
+            "\"backbuffer\":" + SizeJson(bbW, bbH) + ","
+            "\"viewport\":" + RectJson(c.clip_x, c.clip_y, c.clip_w, c.clip_h) + ","
+            "\"draw\":" + SizeJson(c.draw_width, c.draw_height) + ","
+            "\"render_src\":" + SizeJson(r.render_src_w, r.render_src_h) + ","
+            "\"guest_native\":" + SizeJson(r.guest_native_w, r.guest_native_h) + ","
+            "\"scale\":{\"x\":" + FloatJson(scaleX) + ",\"y\":" + FloatJson(scaleY) + "},"
+            "\"aspect_correction\":" + (r.aspect_correction ? "true" : "false") + ","
+            "\"fullscreen\":" + (r.fullscreen ? "true" : "false") + ","
+            "\"pixel_shader\":\"" + JsonEscape(c.pixel_shader) + "\"},"
+        "\"pixel_format\":\"rgba8888\","
+        "\"" + payloadField + "\":\"" + Base64Encode(encoded.data(), encoded.size()) + "\"" +
+        sourceJson + "}}";
 }
 
 /* Phase 4C: execution.continue. DEBUG_AI_DoContinue() (debug.cpp) performs
@@ -3685,6 +3928,103 @@ static void HandleLine(const std::shared_ptr<AIConnection> &conn, const std::str
                     "video.frame.capture did not complete within the timeout -- no frame was "
                     "rendered in time (is the guest currently running and producing video output?)");
         }
+        return;
+    } else if (method == "video.composite.capture") {
+        /* Phase 9A. Like video.frame.capture, does not require the
+         * debugger to be running, but needs a frame to be rendered and
+         * presented before the timeout -- a guest stopped at a breakpoint
+         * or a minimized window yields EXECUTION_TIMEOUT. See
+         * docs/phase9a-composite-capture-design.md. */
+        if (!params) { RespondError("INVALID_PARAMETER", "video.composite.capture requires \"params\""); return; }
+        CompositeCaptureParams p;
+        auto itFormat = params->object.find("format");
+        if (itFormat == params->object.end() || itFormat->second.type != JsonValue::Type::String) {
+            RespondError("INVALID_PARAMETER", "params.format must be a string"); return;
+        }
+        if (itFormat->second.str == "png") p.wantPng = true;
+        else if (itFormat->second.str == "rgba") p.wantPng = false;
+        else { RespondError("INVALID_PARAMETER", "params.format must be \"png\" or \"rgba\""); return; }
+
+        bool haveCrop = false;
+        auto itCrop = params->object.find("crop");
+        if (itCrop != params->object.end() && itCrop->second.type != JsonValue::Type::Null) {
+            if (itCrop->second.type != JsonValue::Type::String ||
+                (itCrop->second.str != "viewport" && itCrop->second.str != "full")) {
+                RespondError("INVALID_PARAMETER", "params.crop must be \"viewport\" or \"full\""); return;
+            }
+            haveCrop = true;
+            p.cropFull = (itCrop->second.str == "full");
+        }
+        auto itRect = params->object.find("rect");
+        if (itRect != params->object.end() && itRect->second.type != JsonValue::Type::Null) {
+            if (!ParseRectParam(itRect->second, p.rect)) {
+                RespondError("INVALID_PARAMETER", "params.rect must be {\"x\",\"y\",\"w\",\"h\"} integers"); return;
+            }
+            p.haveRect = true;
+        }
+        auto itGameRect = params->object.find("game_rect");
+        if (itGameRect != params->object.end() && itGameRect->second.type != JsonValue::Type::Null) {
+            if (!ParseRectParam(itGameRect->second, p.gameRect)) {
+                RespondError("INVALID_PARAMETER", "params.game_rect must be {\"x\",\"y\",\"w\",\"h\"} integers"); return;
+            }
+            p.haveGameRect = true;
+        }
+        if ((int)haveCrop + (int)p.haveRect + (int)p.haveGameRect > 1) {
+            RespondError("INVALID_PARAMETER", "params.crop, params.rect and params.game_rect are mutually exclusive"); return;
+        }
+
+        auto itMaxW = params->object.find("max_width");
+        if (itMaxW != params->object.end() && itMaxW->second.type != JsonValue::Type::Null) {
+            long long mw = itMaxW->second.type == JsonValue::Type::Number ? (long long)itMaxW->second.number : 0;
+            if (mw <= 0 || mw > 0x7FFFFFFFLL) { RespondError("INVALID_PARAMETER", "params.max_width out of range"); return; }
+            p.maxWidth = (uint32_t)mw;
+        }
+        auto itMaxH = params->object.find("max_height");
+        if (itMaxH != params->object.end() && itMaxH->second.type != JsonValue::Type::Null) {
+            long long mh = itMaxH->second.type == JsonValue::Type::Number ? (long long)itMaxH->second.number : 0;
+            if (mh <= 0 || mh > 0x7FFFFFFFLL) { RespondError("INVALID_PARAMETER", "params.max_height out of range"); return; }
+            p.maxHeight = (uint32_t)mh;
+        }
+
+        auto req = std::make_shared<CompositeRequest>();
+        auto itSource = params->object.find("include_source");
+        if (itSource != params->object.end() && itSource->second.type != JsonValue::Type::Null) {
+            if (itSource->second.type != JsonValue::Type::Bool) {
+                RespondError("INVALID_PARAMETER", "params.include_source must be a boolean"); return;
+            }
+            req->include_source = itSource->second.number != 0;
+        }
+
+        /* Design doc 5.4: never fall back to the pre-scaler frame for a
+         * backend without a composite readback path. */
+        if (!PRESENT_CurrentBackendSupported()) {
+            RespondError("COMPOSITE_UNSUPPORTED_BACKEND", std::string("output backend \"") +
+                PRESENT_CurrentBackendName() + "\" does not support composite capture (supported: " +
+                PRESENT_SupportedBackendList() + ")");
+            return;
+        }
+
+        LOG(LOG_MISC, LOG_DEBUG)("AI bridge: request id=%lld method=%s", id, method.c_str());
+        PRESENT_Composite_Submit(req);
+        bool done = PRESENT_Composite_Wait(req, REQUEST_TIMEOUT_SECONDS * 1000u);
+        if (!done && !PRESENT_Composite_Cancel(req)) done = true; /* completed while cancelling */
+        if (conn->stopping.load()) return;
+
+        if (!done) {
+            if (req->device_lost_seen)
+                RespondError("COMPOSITE_DEVICE_LOST",
+                    "the Direct3D device stayed lost for the whole timeout -- no frame could be presented");
+            else
+                RespondError("EXECUTION_TIMEOUT",
+                    "video.composite.capture did not complete within the timeout -- no frame was "
+                    "presented in time (is the guest running, and the window not minimized?)");
+            return;
+        }
+        if (!req->ok) {
+            RespondError(req->error_code.c_str(), req->error_message);
+            return;
+        }
+        SendLine(conn, BuildCompositeCaptureResponse(id, p, *req));
         return;
     } else {
         RespondError("UNKNOWN_METHOD", "unknown method \"" + method + "\"");

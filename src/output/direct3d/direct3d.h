@@ -23,6 +23,8 @@
 #include <d3dx9math.h>
 #include "dosbox.h"
 #include "hq2x_d3d.h"
+#include <string>
+#include <vector>
 
 #define LOG_D3D 0		// Set this to 1 to enable D3D debug messages
 #define D3D_THREAD 1		// Set this to 1 to thread Direct3D
@@ -88,6 +90,13 @@ private:
     DWORD dwWidth, dwHeight;                            // DOSBox framebuffer size
     DWORD dwScaledWidth = 0, dwScaledHeight = 0;                // D3D backbuffer size
     const uint16_t* changedLines = NULL;
+
+    // Phase 9A (DOSBox-X-AI): composite capture. presentRenderSeq is the
+    // RENDER_EndUpdate() sequence of the frame the worker thread is about
+    // to present; captureSurface is a cached system-memory copy target
+    // for back buffer readback (released in InvalidateDeviceObjects()).
+    uint64_t			presentRenderSeq = 0;
+    IDirect3DSurface9*		captureSurface = NULL;
 
 	int					backbuffer_clear_countdown = 0;
 
@@ -232,6 +241,8 @@ public:
     }
 
     void UpdateRectFromSDLSurface(int x,int y,int w,int h);
+    bool ReadBackBufferRGBA8888(int x, int y, int w, int h, std::vector<uint8_t> &out,
+                                std::string &errCode, std::string &errMsg);
     void UpdateRectToSDLSurface(int x,int y,int w,int h);
 
     bool getForceUpdate(void) {
